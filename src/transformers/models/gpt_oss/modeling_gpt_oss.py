@@ -25,6 +25,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from yunchang import LongContextAttention, set_seq_parallel_pg
+from yunchang.kernels import AttnType
 
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -253,43 +255,51 @@ class GptOssAttention(nn.Module):
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-
-        if world_size == 1:
-            return super().forward(
-                hidden_states, position_embeddings, attention_mask, past_key_value, cache_position, **kwargs
-            )
-
         rank = dist.get_rank()
+
+        rd = 8
+        ud = world_size // rd
+        set_seq_parallel_pg(ud, rd, rank, world_size)
+
+        attn_impl_map = {
+            "aiter": AttnType.AITER,
+            "torch": AttnType.TORCH,
+            "fa": AttnType.FA,
+            "fa3": AttnType.FA3,
+            "flashinfer": AttnType.FLASHINFER,
+            "sage_fp16": AttnType.SAGE_FP16,
+            "sage_fp8": AttnType.SAGE_FP8,
+            "sage_fp8_sm90": AttnType.SAGE_FP8_SM90,
+            "sage_fp16_triton": AttnType.SAGE_FP16_TRITON,
+            "sage_auto": AttnType.SAGE_AUTO,
+            "sparse_sage": AttnType.SPARSE_SAGE,
+        }
+
+        ring_impl_type = "basic"
+        attn_type = "fa"
+        attn_processor = None
+
+        usp_attn = LongContextAttention(
+            ring_impl_type=ring_impl_type,
+            attn_type=attn_impl_map[attn_type],
+            attn_processor=attn_processor,
+        )
+
         bsz, q_len, _ = hidden_states.size()
 
-        if q_len % world_size != 0:
-            raise ValueError(f"Sequence length ({q_len}) must be divisible by world size ({world_size}).")
-
-        chunk_size = q_len // world_size
-
-        hidden_states_chunk = hidden_states.chunk(world_size, dim=1)[rank]
-
         cos, sin = position_embeddings
-        cos_chunk = cos.chunk(world_size, dim=1)[rank]
-        sin_chunk = sin.chunk(world_size, dim=1)[rank]
 
         query_states = (
-            self.q_proj(hidden_states_chunk)
-            .view(bsz, chunk_size, self.num_attention_heads, self.head_dim)
-            .transpose(1, 2)
+            self.q_proj(hidden_states).view(bsz, q_len, self.num_attention_heads, self.head_dim).transpose(1, 2)
         )
         key_states = (
-            self.k_proj(hidden_states_chunk)
-            .view(bsz, chunk_size, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
+            self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         )
         value_states = (
-            self.v_proj(hidden_states_chunk)
-            .view(bsz, chunk_size, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
+            self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         )
 
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos_chunk, sin_chunk)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # if past_key_value is not None:
         #    raise NotImplementedError("Distributed KV Caching for generation is complex and not implemented in this example.")
@@ -297,38 +307,40 @@ class GptOssAttention(nn.Module):
         key_states = torch.repeat_interleave(key_states, self.num_key_value_groups, dim=1)
         value_states = torch.repeat_interleave(value_states, self.num_key_value_groups, dim=1)
 
-        attn_output_chunk = torch.zeros_like(query_states)
+        attn_output = torch.zeros_like(query_states)
 
         k_remote, v_remote = key_states, value_states
 
         for i in range(world_size):
             attn_weights = torch.matmul(query_states, k_remote.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
+            print(f"attn_weights: {attn_weights.shape}", flush=True)
+            # print (f'x: {x}', flush=True)
             if attention_mask is not None:
-                q_start_pos = rank * chunk_size
-                k_start_pos = ((rank - i + world_size) % world_size) * chunk_size
+                print(f"attention_mask.shape: {attention_mask.shape}", flush=True)
+                print(f"attention_mask.nonzero().shape: {attention_mask.nonzero().shape}", flush=True)
+            else:
+                print("mask is None", flush=True)
+            """
+            if attention_mask is not None:
+                q_start_pos = rank * q_len
+                k_start_pos = ((rank - i + world_size) % world_size) * q_len
 
-                mask_chunk = attention_mask[
-                    :, :, q_start_pos : q_start_pos + chunk_size, k_start_pos : k_start_pos + chunk_size
-                ]
+                mask_chunk = attention_mask[:, :, q_start_pos:q_start_pos+q_len, k_start_pos:k_start_pos+q_len]
                 attn_weights = attn_weights + mask_chunk
+            """
 
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
             attn_output_partial = torch.matmul(attn_weights, v_remote)
-            attn_output_chunk += attn_output_partial
+            attn_output += attn_output_partial
 
             if i < world_size - 1:
                 k_remote, v_remote = self._ring_communicate(k_remote, v_remote)
 
-        attn_output_chunk = attn_output_chunk.transpose(1, 2).contiguous()
-        attn_output_chunk = attn_output_chunk.reshape(bsz, chunk_size, -1)
-        attn_output_chunk = self.o_proj(attn_output_chunk)
-
-        output_list = [torch.empty_like(attn_output_chunk) for _ in range(world_size)]
-        dist.all_gather(output_list, attn_output_chunk)
-
-        attn_output = torch.cat(output_list, dim=1)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = self.o_proj(attn_output)
 
         return attn_output, None
 
