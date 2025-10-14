@@ -1,0 +1,127 @@
+import os
+import time
+
+import torch
+import torch.distributed as dist
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    raise RuntimeError("flash_attn is necessary for this test!")
+
+
+def setup_distributed():
+    """Initializes the distributed environment."""
+    if dist.is_initialized():
+        return
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+
+def main():
+    # 1. Set up the distributed environment
+    setup_distributed()
+    rank = dist.get_rank()
+    device = f"cuda:{rank}"
+    world_size = dist.get_world_size()
+
+    if rank == 0:
+        print(f"--- Starting benchmark on {world_size} GPUs ---")
+
+    model_id = "/root/.cache/huggingface/hub/gpt-oss-120b/"
+
+    # Each process loads the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+
+    # 2. Load the model onto the specific GPU for each process
+    # The model code itself MUST have the Ring Attention logic implemented.
+    # We are NOT using device_map here.
+    if rank == 0:
+        print("Loading model...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype="auto",
+        device_map=device,
+    )#.to(device)
+    model.eval()
+
+    # torch.compile can be added here if desired, but test without it first.
+    #model = torch.compile(model)
+
+    # 3. Create input data on each GPU
+    # Use a fixed seed to ensure all GPUs have the same input
+    torch.manual_seed(42)
+    isl = 2048
+    # Input sequence length must be divisible by world_size for Ring Attention
+    if isl % world_size != 0:
+        if rank == 0:
+            print(f"Error: Input sequence length {isl} is not divisible by world_size {world_size}.")
+        return
+
+    input_ids = torch.randint(0, tokenizer.vocab_size, (1, isl)).to(device)
+    dist.broadcast(input_ids, src=0)
+
+    local_input_ids = torch.empty(1, isl // world_size, dtype=input_ids.dtype).to(device)
+
+    if rank == 0:
+        dist.scatter(local_input_ids, list(input_ids.chunk(world_size, 1)), src=0)
+    else:
+        dist.scatter(local_input_ids, None, src=0)
+
+    # The output sequence length for the benchmark
+    osl = 1 # Example fixed output length
+
+    # --- Warm-up Run ---
+    if rank == 0:
+        print(f"  -> Running warm-up for output length {osl}...")
+
+    # All processes participate in generation
+    _ = model.generate(
+        local_input_ids,
+        max_new_tokens=osl,
+        do_sample=False,
+    )
+    # Use a barrier to synchronize all processes before starting measurement
+    dist.barrier()
+
+    if rank == 0:
+        print("  -> Warm-up complete.")
+
+    # --- Measurement Run ---
+    if rank == 0:
+        print("  -> Running measurement...")
+
+    # Synchronize before timing
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    start_time = time.time()
+
+    outputs = model.generate(
+        local_input_ids,
+        max_new_tokens=osl,
+        do_sample=False
+    )
+
+    # Synchronize after timing
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    end_time = time.time()
+
+    # 4. Collect and print results only on the main process
+    if rank == 0:
+        elapsed_time = end_time - start_time
+        tokens_per_second = (osl) / elapsed_time
+
+        print("\n--- Benchmark Summary ---")
+        print(f"Input Length:  {isl}")
+        print(f"Output Length: {osl}")
+        print(f"World Size:    {world_size} GPUs")
+        print(f"Total Time:    {elapsed_time:.4f} seconds")
+        print(f"Throughput:    {tokens_per_second:.2f} tokens/sec")
+
+if __name__ == "__main__":
+    main()

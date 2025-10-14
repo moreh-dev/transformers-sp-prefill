@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import math
 from typing import Optional, Unpack
 
 import torch
@@ -313,6 +312,7 @@ class GptOssAttention(Qwen2Attention):
             attn_processor=attn_processor,
         )
 
+
         bsz, q_len, _ = hidden_states.size()
 
         cos, sin = position_embeddings
@@ -323,43 +323,22 @@ class GptOssAttention(Qwen2Attention):
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        #if past_key_value is not None:
-        #    raise NotImplementedError("Distributed KV Caching for generation is complex and not implemented in this example.")
+        if past_key_value is not None:
+            cache_kwargs = {"cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        key_states = torch.repeat_interleave(key_states, self.num_key_value_groups, dim=1)
-        value_states = torch.repeat_interleave(value_states, self.num_key_value_groups, dim=1)
+        causal = True
+        window_size = (128, 128)
+        attn_output = usp_attn(
+            query_states,
+            key_states,
+            value_states,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            causal=causal,
+            #window_size=window_size,
+        )
 
-        attn_output = torch.zeros_like(query_states)
-
-        k_remote, v_remote = key_states, value_states
-
-        for i in range(world_size):
-            attn_weights = torch.matmul(query_states, k_remote.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-            print (f'attn_weights: {attn_weights.shape}', flush=True)
-            #print (f'x: {x}', flush=True)
-            if attention_mask is not None:
-                print (f'attention_mask.shape: {attention_mask.shape}', flush=True)
-                print (f'attention_mask.nonzero().shape: {attention_mask.nonzero().shape}', flush=True)
-            else:
-                print ('mask is None', flush=True)
-            """
-            if attention_mask is not None:
-                q_start_pos = rank * q_len
-                k_start_pos = ((rank - i + world_size) % world_size) * q_len
-
-                mask_chunk = attention_mask[:, :, q_start_pos:q_start_pos+q_len, k_start_pos:k_start_pos+q_len]
-                attn_weights = attn_weights + mask_chunk
-            """
-
-            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-            attn_output_partial = torch.matmul(attn_weights, v_remote)
-            attn_output += attn_output_partial
-
-            if i < world_size - 1:
-                k_remote, v_remote = self._ring_communicate(k_remote, v_remote)
-
+        print (f'attn_output.shape: {attn_output.shape}', flush=True)
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
