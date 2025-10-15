@@ -21,11 +21,9 @@
 from typing import Optional, Union
 
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
-from yunchang import LongContextAttention, set_seq_parallel_pg
-from yunchang.kernels import AttnType
+from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -309,49 +307,25 @@ class GptOssAttention(nn.Module):
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
-
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
-        rank = dist.get_rank()
-
-        rd = world_size
-        ud = world_size // rd
-        set_seq_parallel_pg(ud, rd, rank, world_size)
-
-        attn_impl_map = {
-            "aiter": AttnType.AITER,
-            "torch": AttnType.TORCH,
-            "fa": AttnType.FA,
-            "fa3": AttnType.FA3,
-            "flashinfer": AttnType.FLASHINFER,
-            "sage_fp16": AttnType.SAGE_FP16,
-            "sage_fp8": AttnType.SAGE_FP8,
-            "sage_fp8_sm90": AttnType.SAGE_FP8_SM90,
-            "sage_fp16_triton": AttnType.SAGE_FP16_TRITON,
-            "sage_auto": AttnType.SAGE_AUTO,
-            "sparse_sage": AttnType.SPARSE_SAGE,
-        }
-
-        ring_impl_type = "basic"
-        attn_type = "fa"
-        attn_processor = None
-
-        usp_attn = LongContextAttention(
-            ring_impl_type=ring_impl_type,
-            attn_type=attn_impl_map[attn_type],
-            attn_processor=attn_processor,
-        )
+        #query_states = query_states.transpose(1, 2)
+        #key_states = key_states.transpose(1, 2)
+        #value_states = value_states.transpose(1, 2)
 
         causal = True
-        attn_output = usp_attn(
+
+        if self.sliding_window is not None:
+            window_size=(self.sliding_window,) * 2
+        else:
+            window_size = (-1, -1)
+
+        attn_output = xFuserLongContextAttention()(
+            None,
             query_states,
             key_states,
             value_states,
             dropout_p=0.0 if not self.training else self.attention_dropout,
             causal=causal,
-            #window_size=(self.sliding_window,) * 2,
+            window_size=window_size,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
