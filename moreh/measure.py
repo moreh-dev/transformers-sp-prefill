@@ -1,10 +1,19 @@
 import argparse
+import logging
 import os
 import time
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    datefmt="%Y/%m/%d %H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
 
 def init_distributed(sp_size, pp_size):
@@ -23,8 +32,8 @@ def init_distributed(sp_size, pp_size):
         mesh = torch.arange(world_size).reshape(sp_size, pp_size)
         device_mesh = DeviceMesh(device_type="cuda", mesh=mesh, mesh_dim_names=("sp", "pp"))
         device = torch.device(f"cuda:{local_rank}")
-        print(f"Rank {rank}/{world_size} | Local rank: {local_rank} | Device: {device}")
-        print(f"Device mesh created: {device_mesh}")
+        logger.info(f"Rank {rank}/{world_size} | Local rank: {local_rank} | Device: {device}")
+        logger.info(f"Device mesh created: {device_mesh}")
         return device, device_mesh
     else:
         # Single device mode
@@ -33,13 +42,13 @@ def init_distributed(sp_size, pp_size):
                 "Single device mode requires sp_size=1 and pp_size=1. Use torchrun for distributed execution."
             )
         device = torch.device("cuda:0")
-        print(f"Running in single device mode on {device}")
+        logger.info(f"Running in single device mode on {device}")
         return device, None
 
 
 def load_model(model_id, device):
     """Load tokenizer and model."""
-    print(f"Loading model from {model_id}...")
+    logger.info(f"Loading model from {model_id}...")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -49,7 +58,7 @@ def load_model(model_id, device):
     )
 
     model = torch.compile(model)
-    print("Model loaded and compiled successfully.")
+    logger.info("Model loaded and compiled successfully.")
 
     return tokenizer, model
 
@@ -59,20 +68,20 @@ def measure_performance(model, input_ids, output_sequence_lengths):
     results = {}
 
     for osl in output_sequence_lengths:
-        print(f"\n[Output Sequence Length: {osl}]")
+        logger.info(f"Output Sequence Length: {osl}")
 
         # Warm-up
-        print("  -> Running warm-up...")
+        logger.info("Running warm-up...")
         _ = model.generate(
             input_ids,
             max_new_tokens=osl,
             do_sample=False,
         )
         torch.cuda.synchronize()
-        print("  -> Warm-up complete.")
+        logger.info("Warm-up complete.")
 
         # Measurement
-        print("  -> Running measurement...")
+        logger.info("Running measurement...")
         torch.cuda.synchronize()
         start_time = time.time()
 
@@ -87,16 +96,16 @@ def measure_performance(model, input_ids, output_sequence_lengths):
 
         elapsed_time = end_time - start_time
         results[osl] = elapsed_time
-        print(f"  -> Generation took: {elapsed_time:.4f} seconds")
+        logger.info(f"Generation took: {elapsed_time:.4f} seconds")
 
     return results
 
 
 def print_summary(results):
     """Print benchmark summary."""
-    print("\n--- Benchmark Summary ---")
+    logger.info("--- Benchmark Summary ---")
     for osl, t in results.items():
-        print(f"Tokens: {osl:<4} | Time: {t:.4f} sec")
+        logger.info(f"Tokens: {osl:<4} | Time: {t:.4f} sec")
 
 
 def main():
@@ -142,7 +151,7 @@ def main():
     tokenizer, model = load_model(args.model, device)
 
     # Generate random input
-    print(f"\nGenerating random input with length {args.input_length}...")
+    logger.info(f"Generating random input with length {args.input_length}...")
     input_ids = torch.randint(0, tokenizer.vocab_size, (1, args.input_length)).to(device)
 
     # Measure performance
