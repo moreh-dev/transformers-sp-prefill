@@ -18,11 +18,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
+from yunchang import LongContextAttention, set_seq_parallel_pg
+from yunchang.kernels import AttnType
 
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -31,7 +34,7 @@ from ...masking_utils import create_causal_mask, create_sliding_window_causal_ma
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import OutputRecorder, check_model_inputs
@@ -306,26 +309,54 @@ class GptOssAttention(nn.Module):
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
 
-        attn_output, attn_weights = attention_interface(
-            self,
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank()
+
+        rd = world_size
+        ud = world_size // rd
+        set_seq_parallel_pg(ud, rd, rank, world_size)
+
+        attn_impl_map = {
+            "aiter": AttnType.AITER,
+            "torch": AttnType.TORCH,
+            "fa": AttnType.FA,
+            "fa3": AttnType.FA3,
+            "flashinfer": AttnType.FLASHINFER,
+            "sage_fp16": AttnType.SAGE_FP16,
+            "sage_fp8": AttnType.SAGE_FP8,
+            "sage_fp8_sm90": AttnType.SAGE_FP8_SM90,
+            "sage_fp16_triton": AttnType.SAGE_FP16_TRITON,
+            "sage_auto": AttnType.SAGE_AUTO,
+            "sparse_sage": AttnType.SPARSE_SAGE,
+        }
+
+        ring_impl_type = "basic"
+        attn_type = "fa"
+        attn_processor = None
+
+        usp_attn = LongContextAttention(
+            ring_impl_type=ring_impl_type,
+            attn_type=attn_impl_map[attn_type],
+            attn_processor=attn_processor,
+        )
+
+        causal = True
+        attn_output = usp_attn(
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,  # diff with Llama
-            **kwargs,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            causal=causal,
+            #window_size=(self.sliding_window,) * 2,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output
 
 
 class GptOssDecoderLayer(GradientCheckpointingLayer):
@@ -352,7 +383,7 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
