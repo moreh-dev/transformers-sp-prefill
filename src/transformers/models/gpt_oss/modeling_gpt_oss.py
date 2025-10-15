@@ -23,6 +23,10 @@ from typing import Optional, Union
 import torch
 from torch import nn
 from torch.nn import functional as F
+from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
+    get_sp_group,
+)
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 
 from ...cache_utils import Cache, DynamicCache
@@ -181,6 +185,10 @@ class GptOssRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
+        sp_rank = get_sequence_parallel_rank()
+        local_seq_len = int(position_ids.shape[-1])
+        position_ids += (sp_rank * local_seq_len)
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -504,6 +512,8 @@ class GptOssModel(GptOssPreTrainedModel):
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)
+        hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+        print(hidden_states.shape)
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
