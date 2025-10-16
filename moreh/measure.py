@@ -1,6 +1,9 @@
+import time  # Import the time module
+
 import torch
-import time # Import the time module
-from transformers import AutoTokenizer, AutoModelForCausalLM
+
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 
 model_id = "/root/.cache/huggingface/hub/gpt-oss-120b/"
 device = "cuda:0" # Explicitly target the first GPU
@@ -22,7 +25,11 @@ messages = [
 
 isl = 2048
 
+torch.manual_seed(2025)
+
 input_ids = torch.randint(0, tokenizer.vocab_size, (1, isl)).to(device)
+
+print (input_ids)
 
 results = {}
 
@@ -38,7 +45,7 @@ for osl in [1,]:
     print("  -> Warm-up complete.")
 
     print("  -> Running measurement...")
-    torch.cuda.synchronize() 
+    torch.cuda.synchronize()
     start_time = time.time()
 
     outputs = model.generate(
@@ -49,7 +56,7 @@ for osl in [1,]:
 
     torch.cuda.synchronize()
     end_time = time.time()
-    
+
     elapsed_time = end_time - start_time
     results[osl] = elapsed_time
     print(f"  -> For {osl} output tokens, generation took: {elapsed_time:.4f} seconds")
