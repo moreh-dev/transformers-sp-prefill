@@ -416,6 +416,105 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
     # Output is already (B, S, H, D), no transpose needed
     return output, lse_output
 
+def torch_attention_with_sinks_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    window_size: tuple[int, int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    제공된 Triton 커널과 동일한 기능을 하는 PyTorch 구현.
+
+    Args:
+        query (torch.Tensor): 쿼리 텐서 (B, S, H, D)
+        key (torch.Tensor): 키 텐서 (B, S, H_kv, D)
+        value (torch.Tensor): 값 텐서 (B, S, H_kv, D)
+        sinks (torch.Tensor): 싱크 텐서 (H,)
+        scale (float): 어텐션 스코어 스케일링 팩터
+        is_causal (bool): 인과적 마스크 적용 여부
+        window_size (Tuple[int, int]): (past, future) 윈도우 크기. -1이면 비활성화.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - output (torch.Tensor): 어텐션 출력 (B, S, H, D)
+            - lse (torch.Tensor): Log-Sum-Exp 값 (B, H, S)
+    """
+    # 텐서 shape 가져오기
+    batch_size, seq_len, num_query_heads, head_size = query.shape
+    _, _, num_kv_heads, _ = key.shape
+
+    # Triton 커널의 (B, S, H, D) 레이아웃에 맞춰 계산하기 위해 (B, H, S, D)로 변경
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+
+    # GQA를 위한 Key/Value 반복
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    key = repeat_kv(key, num_queries_per_kv)
+    value = repeat_kv(value, num_queries_per_kv)
+
+    # 1. QK^T 계산
+    # (B, H, S, D) @ (B, H, D, S) -> (B, H, S, S)
+    attn_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
+
+    # 2. 마스킹 적용 (Causal, Sliding Window)
+    # Triton 커널은 -inf를 더하는 대신 tl.where를 사용하지만, PyTorch에서는 더하는 것이 일반적입니다.
+    mask = torch.full((seq_len, seq_len), float("-inf"), device=query.device)
+
+    if is_causal:
+        # 인과적 마스크: 현재 위치 이전의 토큰만 보도록 마스킹
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
+        attn_weights.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
+
+    # 슬라이딩 윈도우 마스크
+    q_indices = torch.arange(seq_len, device=query.device)[:, None]
+    k_indices = torch.arange(seq_len, device=query.device)[None, :]
+
+    if window_size[0] != -1: # WINDOW_SIZE_PAST
+        past_mask = (q_indices - k_indices) >= window_size[0]
+        attn_weights.masked_fill_(past_mask[None, None, :, :], float("-inf"))
+
+    if window_size[1] != -1: # WINDOW_SIZE_FUTURE
+        future_mask = (k_indices - q_indices) > window_size[1]
+        attn_weights.masked_fill_(future_mask[None, None, :, :], float("-inf"))
+
+    # 3. Sink 로직 적용 및 Softmax 계산
+    # sinks: (H,) -> (1, H, 1, 1) -> (B, H, S, 1)
+    # attn_weights에 sink 값을 추가하여 softmax를 계산합니다.
+    expanded_sinks = sinks.view(1, -1, 1, 1).expand(batch_size, -1, seq_len, 1)
+    combined_logits = torch.cat([attn_weights, expanded_sinks], dim=-1)
+
+    # 4. LSE(Log-Sum-Exp) 계산
+    # LSE(x) = max(x) + log(sum(exp(x - max(x))))
+    m, _ = torch.max(combined_logits, dim=-1, keepdim=True)
+    # m이 -inf가 되는 경우를 방지 (모든 logit이 -inf일 때)
+    m = torch.where(torch.isinf(m), 0.0, m)
+
+    p = torch.exp(combined_logits - m)
+    l = torch.sum(p, dim=-1)
+    lse = m.squeeze(-1) + torch.log(l) # (B, H, S)
+
+    # 5. 최종 어텐션 가중치 및 출력 계산
+    # Softmax 확률 계산 (sink 포함)
+    probs = p / l.unsqueeze(-1)
+
+    # sink에 해당하는 마지막 확률 값을 제외
+    scores = probs[..., :-1]
+
+    scores = scores.to(query.dtype)
+
+    # 어텐션 출력: (B, H, S, S) @ (B, H, S, D) -> (B, H, S, D)
+    output = torch.matmul(scores, value)
+
+    # 최종 출력을 (B, S, H, D) 형태로 변환
+    output = output.transpose(1, 2).contiguous()
+
+    # Triton 래퍼가 (B, H, S) 형태의 LSE를 기대하므로 lse는 그대로 반환
+    return output, lse
+
 def moreh_gpt_attention(
         module,
         query,
@@ -464,7 +563,7 @@ def moreh_gpt_attention(
             comm.commit()
             key, value = key_layer, value_layer
         if not causal or step <= comm.rank:
-            block_out, block_lse = triton_attention_forward(
+            block_out, block_lse = torch_attention_with_sinks_forward(
                 query_layer,
                 key,
                 value,
@@ -734,9 +833,10 @@ class GptOssModel(GptOssPreTrainedModel):
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)
-        print (hidden_states.shape)
         hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
-        print (hidden_states.shape)
+        torch.save(hidden_states, 'ring.pt')
+        import sys; sys.exit(0)
+
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,

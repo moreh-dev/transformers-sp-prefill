@@ -34,7 +34,7 @@ def setup_distributed():
 
 def main():
     # 1. Set up the distributed environment
-    torch.manual_seed(2025)
+    torch.manual_seed(2)
 
     setup_distributed()
     rank = dist.get_rank()
@@ -53,7 +53,7 @@ def main():
     # The model code itself MUST have the Ring Attention logic implemented.
     # We are NOT using device_map here.
 
-    isl = 1024 * 8
+    isl = 1024 * 2
     input_ids = torch.randint(0, tokenizer.vocab_size, (1, isl)).to(device)
     dist.broadcast(input_ids, src=0)
 
@@ -81,7 +81,6 @@ def main():
 
     # 3. Create input data on each GPU
     # Use a fixed seed to ensure all GPUs have the same input
-    torch.manual_seed(42)
     # Input sequence length must be divisible by world_size for Ring Attention
     if isl % world_size != 0:
         if rank == 0:
