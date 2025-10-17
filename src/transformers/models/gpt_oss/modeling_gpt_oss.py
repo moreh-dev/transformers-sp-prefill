@@ -656,6 +656,9 @@ class GptOssAttention(nn.Module):
             causal=causal,
             window_size=window_size,
         )
+        attn_output = get_sp_group().all_gather(attn_output, dim=1)
+        torch.save(attn_output, 'ring_attn_output.pt')
+        import sys; sys.exit(0)
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
