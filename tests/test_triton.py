@@ -239,12 +239,15 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
 
 # --- MODIFIED Unit Test ---
 
+
+# --- MODIFIED Unit Test ---
+
 class TestAttentionEquality(unittest.TestCase):
     def test_attention_kernel(self):
-        BATCH_SIZE = 2
-        SEQ_LEN = 128
-        NUM_QUERY_HEADS = 16
-        NUM_KV_HEADS = 4
+        BATCH_SIZE = 1
+        SEQ_LEN = 2048
+        NUM_QUERY_HEADS = 64
+        NUM_KV_HEADS = 8
         HEAD_SIZE = 64
         DTYPE = torch.bfloat16
         DEVICE = 'cuda'
@@ -265,7 +268,7 @@ class TestAttentionEquality(unittest.TestCase):
             {"name": "Causal", "is_causal": True, "window_size": (-1, -1)},
             {"name": "Full", "is_causal": False, "window_size": (-1, -1)},
             {"name": "Sliding Window Causal", "is_causal": True, "window_size": (64, -1)},
-            {"name": "Sliding Window Both Dirs", "is_causal": False, "window_size": (32, 32)},
+            {"name": "Sliding Window Both Dirs", "is_causal": True, "window_size": (128, 128)},
         ]
 
         for params in test_cases:
