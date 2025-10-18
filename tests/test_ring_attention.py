@@ -80,23 +80,30 @@ class RingAttentionTest(unittest.TestCase):
         dist.destroy_process_group()
 
     def test_ring_attention_vs_sdpa(self):
-        q_total = torch.load('q.pt')
-        k_total = torch.load('k.pt')
-        v_total = torch.load('v.pt')
-        
-        #batch_size, total_seq_len, num_heads, head_dim = q_total.shape
-        batch_size, num_heads, total_seq_len, head_dim = q_total.shape
-        seq_dim = 2
-
         rank = get_sequence_parallel_rank()
-        q_total = q_total.to(torch.device(rank))
-        k_total = k_total.to(torch.device(rank))
-        v_total = v_total.to(torch.device(rank))
+        device = torch.device(rank) 
+
+        batch_size = 1
+        num_heads = 64
+        kv_num_heads = 8
+        total_seq_len = 2048
+        head_dim = 64
+        
+        dtype = torch.bfloat16
+
+        q_total = torch.randn(batch_size, num_heads, total_seq_len, head_dim, device=device, dtype=dtype)
+        k_total = torch.randn(batch_size, kv_num_heads, total_seq_len, head_dim, device=device, dtype=dtype)
+        v_total = torch.randn(batch_size, kv_num_heads, total_seq_len, head_dim, device=device, dtype=dtype)
+
+        dist.broadcast(q_total, src=0)
+        dist.broadcast(k_total, src=0)
+        dist.broadcast(v_total, src=0)
+        
+        seq_dim = 2
 
         q_total_trans = q_total.transpose(1, 2).contiguous()
         k_total_trans = k_total.transpose(1, 2).contiguous()
         v_total_trans = v_total.transpose(1, 2).contiguous()
-
 
         q = q_total.chunk(self.world_size, dim=seq_dim)[self.rank].contiguous()
         k = k_total.chunk(self.world_size, dim=seq_dim)[self.rank].contiguous()
@@ -105,7 +112,6 @@ class RingAttentionTest(unittest.TestCase):
         q.trans = q.transpose(1, 2).contiguous()
         k.trans = k.transpose(1, 2).contiguous()
         v.trans = v.transpose(1, 2).contiguous()
-
 
         causal = True
         window_size = (-1, -1)
