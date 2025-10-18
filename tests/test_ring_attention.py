@@ -1,8 +1,8 @@
+import math
 import unittest
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 import torch.nn.functional as F
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
@@ -11,6 +11,9 @@ from xfuser.core.distributed import (
     initialize_model_parallel,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from yunchang.comm.all_to_all import SeqAllToAll4D
+from yunchang.kernels import AttnType
+from yunchang.ring.utils import RingComm, update_out_and_lse
 
 
 def rotate_half(x):
@@ -32,27 +35,152 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-def eager_attention_forward(
+def torch_attention_with_sinks_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    #sinks: torch.Tensor,
-    scaling: float,
-    dropout: float = 0.0,
-):
-    assert query.shape[1] % key.shape[1] == 0, "Number of attention heads must be divisible by number of key/value heads."
-    num_key_value_groups = query.shape[1] // key.shape[1]
+    sinks: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    window_size: tuple[int, int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    PyTorch implementation equivalent to the provided Triton kernel.
 
-    key_states = repeat_kv(key, num_key_value_groups)
-    value_states = repeat_kv(value, num_key_value_groups)
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    Args:
+        query (torch.Tensor): Query tensor (B, S, H, D)
+        key (torch.Tensor): Key tensor (B, S, H_kv, D)
+        value (torch.Tensor): Value tensor (B, S, H_kv, D)
+        sinks (torch.Tensor): Sinks tensor (H,)
+        scale (float): Attention score scaling factor
+        is_causal (bool): Whether to apply a causal mask
+        window_size (Tuple[int, int]): Window size for sliding window attention (past, future)
 
-    probs = F.softmax(attn_weights, dim=-1, dtype=attn_weights.dtype)
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - output (torch.Tensor): Attention output (B, S, H, D)
+            - lse (torch.Tensor): Log-Sum-Exp values (B, H, S)
+    """
+    batch_size, seq_len, num_query_heads, head_size = query.shape
+    _, _, num_kv_heads, _ = key.shape
 
-    attn_weights = nn.functional.dropout(probs, p=dropout, training=False)
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
+    # Transpose to (B, H, S, D) for computation
+    query = query.transpose(1, 2)
+    key = key.transpose(1, 2)
+    value = value.transpose(1, 2)
+
+    # Repeat Key/Value for Grouped-Query Attention (GQA)
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    key = repeat_kv(key, num_queries_per_kv)
+    value = repeat_kv(value, num_queries_per_kv)
+
+    attn_weights = torch.matmul(query, key.transpose(-2, -1)) * scale
+
+    # Apply causal and sliding window masks
+    if is_causal:
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
+        attn_weights.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
+
+    q_indices = torch.arange(seq_len, device=query.device)[:, None]
+    k_indices = torch.arange(seq_len, device=query.device)[None, :]
+
+    if window_size[0] != -1:  # Past window
+        past_mask = (q_indices - k_indices) >= window_size[0]
+        attn_weights.masked_fill_(past_mask[None, None, :, :], float("-inf"))
+
+    if window_size[1] != -1:  # Future window
+        future_mask = (k_indices - q_indices) > window_size[1]
+        attn_weights.masked_fill_(future_mask[None, None, :, :], float("-inf"))
+
+    # Expand sinks and concatenate them to the attention logits
+    expanded_sinks = sinks.view(1, -1, 1, 1).expand(batch_size, -1, seq_len, 1)
+    combined_logits = torch.cat([attn_weights, expanded_sinks], dim=-1)
+
+    # Calculate Log-Sum-Exp efficiently
+    lse = torch.logsumexp(combined_logits, dim=-1)
+
+    # Compute softmax over logits including the sink for stable probability calculation
+    # Use float32 for softmax stability
+    probs = F.softmax(combined_logits, dim=-1, dtype=torch.float32).to(query.dtype)
+
+    # Exclude the last probability value which corresponds to the sink
+    scores = probs[..., :-1]
+
+    # Compute attention output
+    output = torch.matmul(scores, value)
+
+    # Transpose output back to (B, S, H, D)
+    output = output.transpose(1, 2).contiguous()
+
+    return output, lse
+
+def moreh_gpt_attention(
+        module,
+        query,
+        key,
+        value,
+        sinks,
+        *,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+        window_size=(-1, -1),
+    ) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert module.attn_type == AttnType.TORCH
+
+    query_layer = SeqAllToAll4D.apply(
+        module.ulysses_pg, query, module.scatter_idx, module.gather_idx
+    )
+    key_layer = SeqAllToAll4D.apply(
+        module.ulysses_pg, key, module.scatter_idx, module.gather_idx
+    )
+    value_layer = SeqAllToAll4D.apply(
+        module.ulysses_pg, value, module.scatter_idx, module.gather_idx
+    )
+
+    key_layer = key_layer.contiguous()
+    value_layer = value_layer.contiguous()
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
+    comm = RingComm(module.ring_pg)
+
+    out = None
+    lse = None
+
+    next_k, next_v = None, None
+
+    for step in range(comm.world_size):
+        if step + 1 != comm.world_size:
+            next_k: torch.Tensor = comm.send_recv(key_layer)
+            next_v: torch.Tensor = comm.send_recv(value_layer)
+            comm.commit()
+            key, value = key_layer, value_layer
+        if not causal or step <= comm.rank:
+            block_out, block_lse = torch_attention_with_sinks_forward(
+                query_layer,
+                key,
+                value,
+                sinks,
+                scale=softmax_scale,
+                is_causal=causal and step == 0,
+                window_size=window_size,
+            )
+            #block_out = block_out.transpose(1, 2)
+            block_lse = block_lse.to(query_layer.dtype)
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
+        if step + 1 != comm.world_size:
+            comm.wait()
+            key_layer = next_k
+            value_layer = next_v
+
+    out = out.to(query.dtype)
+    output = SeqAllToAll4D.apply(
+            module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+
+    return output
 
 class RingAttentionTest(unittest.TestCase):
 
@@ -81,14 +209,12 @@ class RingAttentionTest(unittest.TestCase):
 
     def test_ring_attention_vs_sdpa(self):
         rank = get_sequence_parallel_rank()
-        device = torch.device(rank) 
-
+        device = torch.device(rank)
         batch_size = 1
         num_heads = 64
         kv_num_heads = 8
         total_seq_len = 2048
         head_dim = 64
-        
         dtype = torch.bfloat16
 
         q_total = torch.randn(batch_size, num_heads, total_seq_len, head_dim, device=device, dtype=dtype)
@@ -109,22 +235,24 @@ class RingAttentionTest(unittest.TestCase):
         k = k_total.chunk(self.world_size, dim=seq_dim)[self.rank].contiguous()
         v = v_total.chunk(self.world_size, dim=seq_dim)[self.rank].contiguous()
         
-        q.trans = q.transpose(1, 2).contiguous()
-        k.trans = k.transpose(1, 2).contiguous()
-        v.trans = v.transpose(1, 2).contiguous()
-
-        causal = True
+        q_trans = q.transpose(1, 2).contiguous()
+        k_trans = k.transpose(1, 2).contiguous()
+        v_trans = v.transpose(1, 2).contiguous()
+        
+        causal = False
         window_size = (-1, -1)
         softmax_scale=head_dim ** -0.5
+        sinks = torch.full((num_heads,), float('-inf'), device=device, dtype=dtype)
 
-        attn_output_local = xFuserLongContextAttention()(
-            None,
-            q.trans,
-            k.trans,
-            v.trans,
+        attn_class= xFuserLongContextAttention(attn_type=AttnType.TORCH)
+        attn_output_local = moreh_gpt_attention(
+            attn_class,
+            q_trans,
+            k_trans,
+            v_trans,
+            sinks,
             dropout_p=0.0,
             causal=causal,
-            softmax_scale=softmax_scale,
             window_size=window_size,
         )
 
