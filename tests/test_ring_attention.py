@@ -93,13 +93,15 @@ class RingAttentionTest(unittest.TestCase):
         k_total_trans = k_total.transpose(1, 2)
         v_total_trans = v_total.transpose(1, 2)
 
-
-
         batch_size, total_seq_len, num_heads, head_dim = q_total.shape
 
         q = q_total.chunk(self.world_size, dim=1)[self.rank].contiguous()
         k = k_total.chunk(self.world_size, dim=1)[self.rank].contiguous()
         v = v_total.chunk(self.world_size, dim=1)[self.rank].contiguous()
+
+        causal = False
+        window_size = (-1, -1)
+        softmax_scale=head_dim ** -0.5
 
         attn_output_local = xFuserLongContextAttention()(
             None,
@@ -107,20 +109,18 @@ class RingAttentionTest(unittest.TestCase):
             k,
             v,
             dropout_p=0.0,
-            causal=False,
-            #window_size=(128, 128),
-            window_size=(-1, -1),
+            causal=causal,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
         )
 
         attn_output = get_sp_group().all_gather(attn_output_local, dim=1)
 
-        sdpa_output = eager_attention_forward(
-            q_total_trans,
-            k_total_trans,
-            v_total_trans,
-            scaling=head_dim ** -0.5,
-            dropout=0.0,
-        )[0]
+        from flash_attn import flash_attn_func
+        sdpa_output = flash_attn_func(q_total, k_total, v_total,
+                                      causal=causal,
+                                      dropout_p=0.0,
+                                      softmax_scale=softmax_scale)
 
         actual_output = attn_output.view(-1, total_seq_len, num_heads, head_dim)
         expected_output = sdpa_output.view(-1, total_seq_len, num_heads, head_dim)
