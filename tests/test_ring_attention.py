@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
     get_sp_group,
     init_distributed_environment,
     initialize_model_parallel,
@@ -35,7 +36,7 @@ def eager_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    sinks: torch.Tensor,
+    #sinks: torch.Tensor,
     scaling: float,
     dropout: float = 0.0,
 ):
@@ -46,16 +47,9 @@ def eager_attention_forward(
     value_states = repeat_kv(value, num_key_value_groups)
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
 
-    sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
-    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    probs = F.softmax(attn_weights, dim=-1, dtype=attn_weights.dtype)
 
-    # This was not in the original implementation and slightly affect results; it prevents overflow in BF16/FP16
-    # when training with bsz>1 we clamp max values.
-
-    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
-    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-    scores = probs[..., :-1]  # we drop the sink here
-    attn_weights = nn.functional.dropout(scores, p=dropout, training=False)
+    attn_weights = nn.functional.dropout(probs, p=dropout, training=False)
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
@@ -86,102 +80,53 @@ class RingAttentionTest(unittest.TestCase):
         dist.destroy_process_group()
 
     def test_ring_attention_vs_sdpa(self):
-        batch_size = 1
-        total_seq_len = 2048
-        assert total_seq_len % self.world_size == 0, "Total sequence length must be divisible by world size."
-        seq_len_per_device = total_seq_len // self.world_size
-        num_heads = 64
-        kv_num_heads = 8
-        head_dim = 64
-        hidden_dim = num_heads * head_dim
-        dtype = torch.bfloat16
-        device = f"cuda:{self.rank}"
+        q_total = torch.load('q.pt')
+        k_total = torch.load('k.pt')
+        v_total = torch.load('v.pt')
 
-        torch.manual_seed(42)
+        rank = get_sequence_parallel_rank()
+        q_total = q_total.to(torch.device(rank))
+        k_total = k_total.to(torch.device(rank))
+        v_total = v_total.to(torch.device(rank))
 
-        q_proj = nn.Linear(hidden_dim, num_heads * head_dim, bias=False, device=device, dtype=dtype)
-        k_proj = nn.Linear(hidden_dim, kv_num_heads * head_dim, bias=False, device=device, dtype=dtype)
-        v_proj = nn.Linear(hidden_dim, kv_num_heads * head_dim, bias=False, device=device, dtype=dtype)
-        o_proj = nn.Linear(num_heads * head_dim, hidden_dim, bias=False, device=device, dtype=dtype)
+        q_total_trans = q_total.transpose(1, 2)
+        k_total_trans = k_total.transpose(1, 2)
+        v_total_trans = v_total.transpose(1, 2)
 
-        if self.rank == 0:
-            full_hidden_states = torch.randn(
-                (batch_size, total_seq_len, hidden_dim), device=device, dtype=dtype
-            )
-            full_cos = torch.randn((batch_size, total_seq_len, head_dim), device=device, dtype=dtype)
-            full_sin = torch.randn((batch_size, total_seq_len, head_dim), device=device, dtype=dtype)
-        else:
-            full_hidden_states = torch.empty((batch_size, total_seq_len, hidden_dim), device=device, dtype=dtype)
-            full_cos = torch.empty((batch_size, total_seq_len, head_dim), device=device, dtype=dtype)
-            full_sin = torch.empty((batch_size, total_seq_len, head_dim), device=device, dtype=dtype)
 
-        dist.broadcast(full_hidden_states, src=0)
-        dist.broadcast(full_cos, src=0)
-        dist.broadcast(full_sin, src=0)
 
-        local_hidden_states = full_hidden_states.chunk(self.world_size, dim=1)[self.rank].contiguous()
-        local_cos = full_cos.chunk(self.world_size, dim=1)[self.rank].contiguous()
-        local_sin = full_sin.chunk(self.world_size, dim=1)[self.rank].contiguous()
+        batch_size, total_seq_len, num_heads, head_dim = q_total.shape
 
-        local_query = q_proj(local_hidden_states).view(batch_size, seq_len_per_device, num_heads, head_dim)
-        local_key = k_proj(local_hidden_states).view(batch_size, seq_len_per_device, kv_num_heads, head_dim)
-        local_value = v_proj(local_hidden_states).view(batch_size, seq_len_per_device, kv_num_heads, head_dim)
-
-        local_query = local_query.transpose(1, 2)
-        local_key = local_key.transpose(1, 2)
-
-        local_query, local_key = apply_rotary_pos_emb(local_query, local_key, local_cos, local_sin)
-
-        local_query = local_query.transpose(1, 2)
-        local_key = local_key.transpose(1, 2)
-
+        q = q_total.chunk(self.world_size, dim=1)[self.rank].contiguous()
+        k = k_total.chunk(self.world_size, dim=1)[self.rank].contiguous()
+        v = v_total.chunk(self.world_size, dim=1)[self.rank].contiguous()
 
         attn_output_local = xFuserLongContextAttention()(
             None,
-            local_query,
-            local_key,
-            local_value,
+            q,
+            k,
+            v,
             dropout_p=0.0,
             causal=False,
             #window_size=(128, 128),
             window_size=(-1, -1),
         )
 
-        attn_output_local = attn_output_local.reshape(batch_size, seq_len_per_device, hidden_dim)
-        output_local_xfuser = o_proj(attn_output_local)
-
-        output_gathered_xfuser = get_sp_group().all_gather(output_local_xfuser, dim=1)
-
-        full_query = q_proj(full_hidden_states).view(batch_size, total_seq_len, num_heads, head_dim).transpose(1, 2)
-        full_key = k_proj(full_hidden_states).view(batch_size, total_seq_len, kv_num_heads, head_dim).transpose(1, 2)
-        full_value = v_proj(full_hidden_states).view(batch_size, total_seq_len, kv_num_heads, head_dim).transpose(1, 2)
-
-        full_query_rope, full_key_rope = apply_rotary_pos_emb(
-            full_query, full_key, full_cos, full_sin
-        )
+        attn_output = get_sp_group().all_gather(attn_output_local, dim=1)
 
         sdpa_output = eager_attention_forward(
-            full_query_rope,
-            full_key_rope,
-            full_value,
-            #sinks=torch.zeros((num_heads), device=device, dtype=dtype),
-            sinks = torch.full((num_heads,), float('-inf'), device=device, dtype=dtype),
+            q_total_trans,
+            k_total_trans,
+            v_total_trans,
             scaling=head_dim ** -0.5,
             dropout=0.0,
         )[0]
 
-        sdpa_output = sdpa_output.transpose(1, 2).contiguous().view(batch_size, total_seq_len, hidden_dim)
-        expected_output = o_proj(sdpa_output)
-
+        actual_output = attn_output.view(-1, total_seq_len, num_heads, head_dim)
+        expected_output = sdpa_output.view(-1, total_seq_len, num_heads, head_dim)
         if self.rank == 0:
-            print("xFuser Ring Attention output shape:", output_gathered_xfuser.shape)
-            print("PyTorch SDPA output shape:", expected_output.shape)
-
-            # Define variables for clarity
-            actual_output = output_gathered_xfuser
-            expected_output = expected_output
-            atol = 0.2
-            rtol = 0.2
+            atol = 1e-2
+            rtol = 1e-2
 
             # Perform the allclose check
             is_close = torch.allclose(actual_output, expected_output, atol=atol, rtol=rtol)
