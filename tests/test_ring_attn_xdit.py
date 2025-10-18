@@ -39,7 +39,7 @@ def torch_attention_with_sinks_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    # Sinks 인자 제거
+    sinks: torch.Tensor,
     scale: float,
     is_causal: bool,
     window_size: tuple[int, int]
@@ -57,7 +57,6 @@ def torch_attention_with_sinks_forward(
 
     attn_weights = torch.matmul(query_transposed, key_transposed.transpose(-2, -1)) * scale
 
-    # --- 마스킹 로직 적용 ---
     if is_causal:
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
         attn_weights.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
@@ -72,22 +71,37 @@ def torch_attention_with_sinks_forward(
     if window_size[1] != -1:
         future_mask = (k_indices - q_indices) > window_size[1]
         attn_weights.masked_fill_(future_mask[None, None, :, :], float("-inf"))
-    
-    # ✨====== Sink 관련 로직이 모두 제거되고, 순수 attn_weights로만 계산 ======✨
-    m, _ = torch.max(attn_weights, dim=-1, keepdim=True)
+
+    row_max_val, _ = torch.max(attn_weights, dim=-1) # shape: (B, Nq, S)
+
+    # If max is -inf, it means the entire row is masked.
+    is_inf_row = torch.isinf(row_max_val) # shape: (B, Nq, S)
+
+    # if torch.all(max_val == -torch.inf)
+
+    expanded_sinks = sinks.view(1, -1, 1, 1).expand(batch_size, -1, seq_len, 1)
+    combined_logits = torch.cat([attn_weights, expanded_sinks], dim=-1)
+
+    m, _ = torch.max(combined_logits, dim=-1, keepdim=True)
     m = torch.where(torch.isinf(m), 0.0, m)
 
-    p = torch.exp(attn_weights - m)
+    p = torch.exp(combined_logits - m)
     l = torch.sum(p, dim=-1)
-    lse = m.squeeze(-1) + torch.log(l + 1e-9) # 반환 lse shape: (B, H, S)
+    lse = m.squeeze(-1) + torch.log(l + 1e-9)
 
     probs = p / (l.unsqueeze(-1) + 1e-9)
-    scores = probs.to(query.dtype)
+    scores = probs[..., :-1]
+    scores = scores.to(query.dtype)
 
     output_transposed = torch.matmul(scores, value_transposed)
-    output = output_transposed.transpose(1, 2).contiguous() # 반환 output shape: (B, S, H, D)
+    output = output_transposed.transpose(1, 2).contiguous()
 
-    return output, lse
+    final_lse = torch.where(is_inf_row, -torch.inf, lse)
+
+    mask_for_output = is_inf_row.transpose(1, 2).unsqueeze(-1)
+    final_output = torch.where(mask_for_output, 0.0, output)
+
+    return final_output, final_lse
 
 
 def moreh_gpt_attention(
@@ -122,21 +136,8 @@ def moreh_gpt_attention(
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
     comm = RingComm(module.ring_pg)
 
-# ✨====== 수정된 부분 시작 ======✨
-
-    batch_size, chunk_len, num_heads, head_dim = query_layer.shape
-
-    out = torch.zeros_like(query_layer)
-
-    lse_accumulator_shape = (batch_size, chunk_len, num_heads, 1)
-    lse = torch.full(lse_accumulator_shape, -torch.inf, dtype=torch.float32, device=query_layer.device)
-
-    # 2. Sink 초기화 로직은 lse shape에 맞게 동일하게 유지
-    if sinks is not None and sinks.numel() > 0:
-        sink_lse_scalar = torch.logsumexp(sinks.float(), dim=-1)
-        lse = torch.full_like(lse, sink_lse_scalar)
-        
-    # ✨====== 수정된 부분 끝 ======✨
+    out = None
+    lse = None
 
     next_k, next_v = None, None
 
@@ -167,6 +168,7 @@ def moreh_gpt_attention(
                 query_layer,
                 key,
                 value,
+                sinks,
                 scale=softmax_scale,
                 is_causal=causal and step == 0,
                 window_size=adjusted_window_size,
@@ -228,10 +230,6 @@ def vanila_attention(
     combined_logits = torch.cat([attn_weights, sinks], dim=-1)
 
     max_logits = combined_logits.max(dim=-1, keepdim=True).values
-
-    # if max is -inf, zero it out to avoid NaNs
-    max_logits = torch.where(torch.isinf(max_logits), 0.0, max_logits)
-
     stable_logits = combined_logits - max_logits
 
     probs = F.softmax(stable_logits, dim=-1, dtype=torch.float32).to(query.dtype)
