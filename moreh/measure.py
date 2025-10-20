@@ -1,4 +1,5 @@
 import argparse
+import gc
 import logging
 import os
 import time
@@ -8,7 +9,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import _ScheduleForwardOnly
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 
 
 logging.basicConfig(
@@ -49,15 +50,20 @@ def init_distributed(sp_size, pp_size):
         return device, None
 
 
-def load_model(model_id, device):
+def load_model(model_id, device, device_map=None):
     """Load tokenizer and model."""
     logger.info(f"Loading model from {model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, device_map=device)
+
+    # Use provided device_map, or default to single device
+    if device_map is None:
+        device_map = device
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         torch_dtype="auto",
-        device_map=device,
+        device_map=device_map,
     )
 
     return tokenizer, model
@@ -81,7 +87,9 @@ def generate_module_names_for_stage(num_layers, pp_size, stage_idx):
         stage_idx: Index of the current stage
 
     Returns:
-        List of module names for the specified stage
+        Tuple of (stage_modules, unused_modules):
+            - stage_modules: List of module names needed for this stage
+            - unused_modules: List of module names not needed for this stage
     """
     assert num_layers % pp_size == 0, f"num_layers ({num_layers}) must be divisible by pp_size ({pp_size})"
 
@@ -89,23 +97,33 @@ def generate_module_names_for_stage(num_layers, pp_size, stage_idx):
     start_layer = stage_idx * layers_per_stage
 
     stage_modules = []
+    unused_modules = []
 
     # All stages must have rotary embedding for position_embeddings
     stage_modules.append('model.rotary_emb')
 
+    # Embedding tokens
     if stage_idx == 0:
         stage_modules.append('model.embed_tokens')
+    else:
+        unused_modules.append('model.embed_tokens')
 
-    # Add transformer layers for this stage
-    for layer_idx in range(start_layer, start_layer + layers_per_stage):
-        stage_modules.append(f'model.layers.{layer_idx}')
+    # Add transformer layers for this stage and mark others as unused
+    for layer_idx in range(num_layers):
+        if start_layer <= layer_idx < start_layer + layers_per_stage:
+            stage_modules.append(f'model.layers.{layer_idx}')
+        else:
+            unused_modules.append(f'model.layers.{layer_idx}')
 
     # Last stage includes norm and lm_head
     if stage_idx == pp_size - 1:
         stage_modules.append('model.norm')
         stage_modules.append('lm_head')
+    else:
+        unused_modules.append('model.norm')
+        unused_modules.append('lm_head')
 
-    return stage_modules
+    return stage_modules, unused_modules
 
 
 def build_stage_from_modules(
@@ -188,7 +206,7 @@ def build_stage_from_modules(
     return stage, model
 
 
-def apply_pipeline_parallel(model, device_mesh, device):
+def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
     """
     Apply pipeline parallelism to the model.
 
@@ -196,6 +214,7 @@ def apply_pipeline_parallel(model, device_mesh, device):
         model: The model to parallelize
         device_mesh: DeviceMesh with 'pp' dimension
         device: Device to place model on
+        stage_modules: Modules names in this stage
 
     Returns:
         Tuple of (pp_schedule, model_parts, has_first_stage, has_last_stage)
@@ -208,15 +227,11 @@ def apply_pipeline_parallel(model, device_mesh, device):
 
     stage_idx = pp_rank
 
-    module_names = generate_module_names_for_stage(num_layers, pp_size, stage_idx)
-
-    logger.info(f"Rank {pp_rank} building stage {stage_idx} with modules: {module_names}")
-
     stage, model_chunk = build_stage_from_modules(
         model,
         stage_idx,
         pp_size,
-        module_names,
+        stage_modules,
         device,
         pp_mesh.get_group(),
     )
@@ -318,10 +333,25 @@ def main():
     # Initialize distributed environment
     device, device_mesh = init_distributed(args.sp_size, args.pp_size)
 
-    # Load model
-    tokenizer, model = load_model(args.model, device)
-
     if args.pp_size > 1:
+        config = AutoConfig.from_pretrained(args.model)
+        num_layers = config.num_hidden_layers
+
+        # Get pp_rank
+        pp_mesh = device_mesh["pp"]
+        pp_rank = pp_mesh.get_local_rank()
+
+        # Generate module names for this stage
+        stage_modules, unused_modules = generate_module_names_for_stage(
+            num_layers, args.pp_size, pp_rank
+        )
+
+        # Create device map: stage modules on device, unused on meta
+        device_map = {**{x: device for x in stage_modules}, **{y: 'meta' for y in unused_modules}}
+
+        # Load model with device_map
+        tokenizer, model = load_model(args.model, device, device_map=device_map)
+
         (
             pp_schedule,
             model_parts,
@@ -331,17 +361,25 @@ def main():
             model,
             device_mesh,
             device,
+            stage_modules,
         )
-        del model
 
-        if has_first_stage:
-            input_ids = torch.randint(0, tokenizer.vocab_size, (2, args.input_length)).to(device)
-            output = pp_schedule.step(input_ids)
-        else:
-            output = pp_schedule.step()
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        with torch.autograd.grad_mode.inference_mode():
+            if has_first_stage:
+                input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
+                output = pp_schedule.step(input_ids)
+            else:
+                output = pp_schedule.step()
         logger.info(f'output ({type(output)}): {output}')
 
     else:
+        # Single device mode
+        tokenizer, model = load_model(args.model, device)
+
         model = torch.compile(model)
         input_ids = torch.randint(0, tokenizer.vocab_size, (1, args.input_length)).to(device)
         results = measure_performance(model, input_ids, args.output_lengths)
