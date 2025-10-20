@@ -416,6 +416,72 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
     # Output is already (B, S, H, D), no transpose needed
     return output, lse_output
 
+def torch_attention_with_sinks_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    window_size: tuple[int, int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seq_len, num_query_heads, head_size = query.shape
+    _, _, num_kv_heads, _ = key.shape
+
+    query_transposed = query.transpose(1, 2)
+    key_transposed = key.transpose(1, 2)
+    value_transposed = value.transpose(1, 2)
+
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    key_transposed = repeat_kv(key_transposed, num_queries_per_kv)
+    value_transposed = repeat_kv(value_transposed, num_queries_per_kv)
+
+    attn_weights = torch.matmul(query_transposed, key_transposed.transpose(-2, -1)) * scale
+
+    if is_causal:
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query.device, dtype=torch.bool), diagonal=1)
+        attn_weights.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
+
+    q_indices = torch.arange(seq_len, device=query.device)[:, None]
+    k_indices = torch.arange(seq_len, device=query.device)[None, :]
+
+    if window_size[0] != -1:
+        past_mask = (q_indices - k_indices) >= window_size[0]
+        attn_weights.masked_fill_(past_mask[None, None, :, :], float("-inf"))
+
+    if window_size[1] != -1:
+        future_mask = (k_indices - q_indices) > window_size[1]
+        attn_weights.masked_fill_(future_mask[None, None, :, :], float("-inf"))
+
+    row_max_val, _ = torch.max(attn_weights, dim=-1) # shape: (B, Nq, S)
+
+    # If max is -inf, it means the entire row is masked.
+    is_inf_row = torch.isinf(row_max_val) # shape: (B, Nq, S)
+
+    expanded_sinks = sinks.view(1, -1, 1, 1).expand(batch_size, -1, seq_len, 1)
+    combined_logits = torch.cat([attn_weights, expanded_sinks], dim=-1)
+
+    m, _ = torch.max(combined_logits, dim=-1, keepdim=True)
+    m = torch.where(torch.isinf(m), 0.0, m)
+
+    p = torch.exp(combined_logits - m)
+    l = torch.sum(p, dim=-1)
+    lse = m.squeeze(-1) + torch.log(l + 1e-9)
+
+    probs = p / (l.unsqueeze(-1) + 1e-9)
+    scores = probs[..., :-1]
+    scores = scores.to(query.dtype)
+
+    output_transposed = torch.matmul(scores, value_transposed)
+    output = output_transposed.transpose(1, 2).contiguous()
+
+    final_lse = torch.where(is_inf_row, -torch.inf, lse)
+
+    mask_for_output = is_inf_row.transpose(1, 2).unsqueeze(-1)
+    final_output = torch.where(mask_for_output, 0.0, output)
+
+    return final_output, final_lse
+
 def moreh_gpt_attention(
         module,
         query,
@@ -457,24 +523,36 @@ def moreh_gpt_attention(
 
     next_k, next_v = None, None
 
+    original_window_size = window_size
+
+    chunk_len = query_layer.shape[1]
+
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
             comm.commit()
-            key, value = key_layer, value_layer
-        if not causal or step <= comm.rank:
-            block_out, block_lse = triton_attention_forward(
+        key, value = key_layer, value_layer
+
+        if original_window_size[0] == -1:
+            adjusted_left = -1
+        else:
+            adjusted_left = original_window_size[0] - step * chunk_len
+
+        adjusted_right = original_window_size[1] if step == 0 else -1
+
+        adjusted_window_size = (adjusted_left, adjusted_right)
+
+        if (not causal or step <= comm.rank) and (step <= 1):
+            block_out, block_lse = torch_attention_with_sinks_forward(
                 query_layer,
                 key,
                 value,
                 sinks,
                 scale=softmax_scale,
                 is_causal=causal and step == 0,
-                window_size=window_size,
+                window_size=adjusted_window_size,
             )
-            #block_out = block_out.transpose(1, 2)
-            block_lse = block_lse.to(query_layer.dtype)
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
@@ -734,9 +812,7 @@ class GptOssModel(GptOssPreTrainedModel):
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)
-        print (hidden_states.shape)
         hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
-        print (hidden_states.shape)
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,

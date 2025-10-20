@@ -77,8 +77,6 @@ def torch_attention_with_sinks_forward(
     # If max is -inf, it means the entire row is masked.
     is_inf_row = torch.isinf(row_max_val) # shape: (B, Nq, S)
 
-    # if torch.all(max_val == -torch.inf)
-
     expanded_sinks = sinks.view(1, -1, 1, 1).expand(batch_size, -1, seq_len, 1)
     combined_logits = torch.cat([attn_weights, expanded_sinks], dim=-1)
 
@@ -147,6 +145,8 @@ def moreh_gpt_attention(
 
 
     for step in range(comm.world_size):
+        attn_done_local = torch.zeros(1, device=query.device, dtype=torch.int32)
+
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
@@ -160,10 +160,11 @@ def moreh_gpt_attention(
             adjusted_left = original_window_size[0] - step * chunk_len
 
         adjusted_right = original_window_size[1] if step == 0 else -1
-
         adjusted_window_size = (adjusted_left, adjusted_right)
 
-        if not causal or step <= comm.rank:
+        if (not causal or step <= comm.rank) and (step <= 1):
+            if comm.rank == 3:
+                print (f'rank {comm.rank} performing attention at step {step} with window size {adjusted_window_size}')
             block_out, block_lse = torch_attention_with_sinks_forward(
                 query_layer,
                 key,
@@ -175,10 +176,17 @@ def moreh_gpt_attention(
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
+            attn_done_local[0] = 1
+
         if step + 1 != comm.world_size:
             comm.wait()
             key_layer = next_k
             value_layer = next_v
+
+        dist.all_reduce(attn_done_local, op=dist.ReduceOp.SUM)
+
+        if attn_done_local.item() == 0:
+            break
 
     out = out.to(query.dtype)
     output = SeqAllToAll4D.apply(
