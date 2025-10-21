@@ -704,6 +704,8 @@ class GptOssModel(GptOssPreTrainedModel):
             )
         hidden_states = self.norm(hidden_states)
         hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+        torch.save(hidden_states, "ring_hidden_states_new_triton.pt")
+        print("GptOssModel: hidden_states gathered from all TP ranks.")
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
