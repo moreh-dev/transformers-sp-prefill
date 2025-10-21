@@ -327,6 +327,12 @@ def main():
         default=1,
         help="Pipeline parallel size"
     )
+    parser.add_argument(
+        "--num-iterations",
+        type=int,
+        default=1,
+        help="Number of iterations to measure performance"
+    )
 
     args = parser.parse_args()
 
@@ -369,12 +375,30 @@ def main():
         torch.cuda.empty_cache()
 
         with torch.autograd.grad_mode.inference_mode():
+            # Warm-up
+            logger.info("Running warm-up...")
             if has_first_stage:
                 input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
                 output = pp_schedule.step(input_ids)
             else:
                 output = pp_schedule.step()
-        logger.info(f'output ({type(output)}): {output}')
+            torch.cuda.synchronize()
+            logger.info("Warm-up complete.")
+
+            dist.barrier()
+            logger.info("Running measurement...")
+            start_time = time.time()
+            for i in range(args.num_iterations):
+                if has_first_stage:
+                    input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
+                    output = pp_schedule.step(input_ids)
+                else:
+                    output = pp_schedule.step()
+            torch.cuda.synchronize()
+            end_time = time.time()
+            elapsed = end_time - start_time
+            logger.info(f"Total elapsed time: {elapsed} seconds, Average: {elapsed / args.num_iterations}")
+
 
     else:
         # Single device mode
