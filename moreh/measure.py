@@ -248,12 +248,13 @@ def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
     return pp_schedule, [model_chunk], has_first_stage, has_last_stage
 
 
-def measure_performance(model, input_ids, output_sequence_lengths):
+def measure_performance(model, input_ids, output_sequence_lengths, num_iterations):
     """Measure generation performance for different output sequence lengths."""
     results = {}
 
     for osl in output_sequence_lengths:
         logger.info(f"Output Sequence Length: {osl}")
+        iteration_times = []
 
         # Warm-up
         logger.info("Running warm-up...")
@@ -265,32 +266,93 @@ def measure_performance(model, input_ids, output_sequence_lengths):
         torch.cuda.synchronize()
         logger.info("Warm-up complete.")
 
-        # Measurement
-        logger.info("Running measurement...")
+        # Measurement iterations
+        logger.info(f"Running {num_iterations} measurement iterations...")
+        for i in range(num_iterations):
+            torch.cuda.synchronize()
+            start_time = time.time()
+
+            outputs = model.generate(
+                input_ids,
+                max_new_tokens=osl,
+                do_sample=False
+            )
+
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            elapsed_time = end_time - start_time
+            iteration_times.append(elapsed_time)
+            logger.info(f"  Iteration {i+1}/{num_iterations}: {elapsed_time:.4f} seconds")
+
+        results[osl] = iteration_times
+
+    return results
+
+
+def measure_pipeline_parallel_performance(pp_schedule, has_first_stage, input_ids, output_sequence_lengths, num_iterations):
+    """Measure pipeline parallel performance for different output sequence lengths."""
+    results = {}
+
+    for osl in output_sequence_lengths:
+        logger.info(f"Output Sequence Length: {osl}")
+        iteration_times = []
+
+        # Warm-up
+        logger.info("Running warm-up...")
+        if has_first_stage:
+            output = pp_schedule.step(input_ids)
+        else:
+            output = pp_schedule.step()
         torch.cuda.synchronize()
-        start_time = time.time()
+        dist.barrier()
+        logger.info("Warm-up complete.")
 
-        outputs = model.generate(
-            input_ids,
-            max_new_tokens=osl,
-            do_sample=False
-        )
+        # Measurement iterations
+        logger.info(f"Running {num_iterations} measurement iterations...")
+        for i in range(num_iterations):
+            torch.cuda.synchronize()
+            start_time = time.time()
 
-        torch.cuda.synchronize()
-        end_time = time.time()
+            if has_first_stage:
+                output = pp_schedule.step(input_ids)
+            else:
+                output = pp_schedule.step()
 
-        elapsed_time = end_time - start_time
-        results[osl] = elapsed_time
-        logger.info(f"Generation took: {elapsed_time:.4f} seconds")
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            elapsed_time = end_time - start_time
+            iteration_times.append(elapsed_time)
+            logger.info(f"  Iteration {i+1}/{num_iterations}: {elapsed_time:.4f} seconds")
+
+        results[osl] = iteration_times
 
     return results
 
 
 def print_summary(results):
     """Print benchmark summary."""
-    logger.info("--- Benchmark Summary ---")
-    for osl, t in results.items():
-        logger.info(f"Tokens: {osl:<4} | Time: {t:.4f} sec")
+    logger.info("="*80)
+    logger.info("Benchmark Summary")
+    logger.info("="*80)
+
+    for osl, times in results.items():
+        logger.info("-" * 40)
+        logger.info(f"Output Sequence Length: {osl}")
+        logger.info("-" * 40)
+
+        for i, t in enumerate(times, 1):
+            logger.info(f"  Iteration {i}: {t:.4f} sec")
+
+        total_time = sum(times)
+        avg_time = total_time / len(times)
+
+        logger.info(f"  {'-' * 38}")
+        logger.info(f"  Total time:   {total_time:.4f} sec")
+        logger.info(f"  Average time: {avg_time:.4f} sec")
+
+    logger.info("="*80)
 
 
 def main():
@@ -374,31 +436,21 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
+        # Generate input_ids once
+        if has_first_stage:
+            input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
+        else:
+            input_ids = None
+
+        # Measure performance
         with torch.autograd.grad_mode.inference_mode():
-            # Warm-up
-            logger.info("Running warm-up...")
-            if has_first_stage:
-                input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
-                output = pp_schedule.step(input_ids)
-            else:
-                output = pp_schedule.step()
-            torch.cuda.synchronize()
-            logger.info("Warm-up complete.")
-
-            dist.barrier()
-            logger.info("Running measurement...")
-            start_time = time.time()
-            for i in range(args.num_iterations):
-                if has_first_stage:
-                    input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
-                    output = pp_schedule.step(input_ids)
-                else:
-                    output = pp_schedule.step()
-            torch.cuda.synchronize()
-            end_time = time.time()
-            elapsed = end_time - start_time
-            logger.info(f"Total elapsed time: {elapsed} seconds, Average: {elapsed / args.num_iterations}")
-
+            results = measure_pipeline_parallel_performance(
+                pp_schedule,
+                has_first_stage,
+                input_ids,
+                args.output_lengths,
+                args.num_iterations
+            )
 
     else:
         # Single device mode
@@ -406,8 +458,9 @@ def main():
 
         model = torch.compile(model)
         input_ids = torch.randint(0, tokenizer.vocab_size, (1, args.input_length)).to(device)
-        results = measure_performance(model, input_ids, args.output_lengths)
-        print_summary(results)
+        results = measure_performance(model, input_ids, args.output_lengths, args.num_iterations)
+
+    print_summary(results)
 
 
 if __name__ == "__main__":
