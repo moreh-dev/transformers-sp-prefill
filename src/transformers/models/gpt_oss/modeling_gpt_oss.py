@@ -191,7 +191,7 @@ class GptOssRotaryEmbedding(nn.Module):
     def forward(self, x, position_ids):
         sp_rank = get_sequence_parallel_rank()
         local_seq_len = int(position_ids.shape[-1])
-        position_ids += (sp_rank * local_seq_len)
+        position_ids += sp_rank * local_seq_len
 
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -268,19 +268,42 @@ def eager_attention_forward(
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
 
+
 @triton.jit
 def kernel_attention_contiguous(
-    output_ptr, lse_ptr, query_ptr, key_ptr, value_ptr, sinks_ptr,
+    output_ptr,
+    lse_ptr,
+    query_ptr,
+    key_ptr,
+    value_ptr,
+    sinks_ptr,
     # Strides for (B, S, H, D) layout
-    stride_out_batch, stride_out_seq, stride_out_head,
-    stride_lse_batch, stride_lse_head, stride_lse_seq,
-    stride_q_batch, stride_q_seq, stride_q_head,
-    stride_k_batch, stride_k_seq, stride_k_head,
-    stride_v_batch, stride_v_seq, stride_v_head,
-    num_query_heads, num_kv_heads, seq_len, head_size,
+    stride_out_batch,
+    stride_out_seq,
+    stride_out_head,
+    stride_lse_batch,
+    stride_lse_head,
+    stride_lse_seq,
+    stride_q_batch,
+    stride_q_seq,
+    stride_q_head,
+    stride_k_batch,
+    stride_k_seq,
+    stride_k_head,
+    stride_v_batch,
+    stride_v_seq,
+    stride_v_head,
+    num_query_heads,
+    num_kv_heads,
+    seq_len,
+    head_size,
     scale,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
-    IS_CAUSAL: tl.constexpr, WINDOW_SIZE_PAST: tl.constexpr, WINDOW_SIZE_FUTURE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    WINDOW_SIZE_PAST: tl.constexpr,
+    WINDOW_SIZE_FUTURE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -290,14 +313,13 @@ def kernel_attention_contiguous(
 
     start_m = tl.program_id(2) * BLOCK_M
 
-    offs_m = start_m + tl.arange(0, BLOCK_M) # Query sequence offsets
-    offs_d = tl.arange(0, BLOCK_DMODEL)     # Head dimension offsets
+    offs_m = start_m + tl.arange(0, BLOCK_M)  # Query sequence offsets
+    offs_d = tl.arange(0, BLOCK_DMODEL)  # Head dimension offsets
 
     # Pointers for Q, K, V based on (B, S, H, D) layout
-    q_ptrs = query_ptr + (batch_idx * stride_q_batch +
-                          offs_m[:, None] * stride_q_seq +
-                          head_idx * stride_q_head +
-                          offs_d[None, :])
+    q_ptrs = query_ptr + (
+        batch_idx * stride_q_batch + offs_m[:, None] * stride_q_seq + head_idx * stride_q_head + offs_d[None, :]
+    )
 
     k_ptrs_base = key_ptr + (batch_idx * stride_k_batch + kv_head_idx * stride_k_head)
     v_ptrs_base = value_ptr + (batch_idx * stride_v_batch + kv_head_idx * stride_v_head)
@@ -306,7 +328,7 @@ def kernel_attention_contiguous(
 
     sink_val = tl.load(sinks_ptr + head_idx).to(tl.float32)
     m_i = tl.full([BLOCK_M], sink_val, tl.float32)
-    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32) # exp(sink_val - sink_val) = 1
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)  # exp(sink_val - sink_val) = 1
 
     q_mask = offs_m < seq_len
 
@@ -319,7 +341,7 @@ def kernel_attention_contiguous(
 
     start_n = 0
     while start_n < end_n:
-        offs_n = start_n + tl.arange(0, BLOCK_N) # Key/Value sequence offsets
+        offs_n = start_n + tl.arange(0, BLOCK_N)  # Key/Value sequence offsets
 
         # Load K.T for the dot product
         k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
@@ -372,11 +394,11 @@ def kernel_attention_contiguous(
 
     # Store Attention Output
     acc = acc / l_i[:, None]
-    out_ptrs = output_ptr + (batch_idx * stride_out_batch +
-                            offs_m[:, None] * stride_out_seq +
-                            head_idx * stride_out_head +
-                            offs_d[None, :])
+    out_ptrs = output_ptr + (
+        batch_idx * stride_out_batch + offs_m[:, None] * stride_out_seq + head_idx * stride_out_head + offs_d[None, :]
+    )
     tl.store(out_ptrs, acc, mask=q_mask[:, None])
+
 
 # --- MODIFIED Python Wrapper for Triton Kernel ---
 def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, window_size: tuple):
@@ -394,25 +416,47 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
     grid = (batch_size, num_query_heads, triton.cdiv(seq_len, BLOCK_M))
 
     kernel_attention_contiguous[grid](
-        output, lse_output, query, key, value, sinks,
+        output,
+        lse_output,
+        query,
+        key,
+        value,
+        sinks,
         # Strides for (B, S, H, D)
-        output.stride(0), output.stride(1), output.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
         # Strides for LSE (B, H, S)
-        lse_output.stride(0), lse_output.stride(1), lse_output.stride(2),
+        lse_output.stride(0),
+        lse_output.stride(1),
+        lse_output.stride(2),
         # Strides for Q (B, S, H, D)
-        query.stride(0), query.stride(1), query.stride(2),
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
         # Strides for K (B, S, H_kv, D)
-        key.stride(0), key.stride(1), key.stride(2),
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
         # Strides for V (B, S, H_kv, D)
-        value.stride(0), value.stride(1), value.stride(2),
-        num_query_heads, num_kv_heads, seq_len, head_size,
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        num_query_heads,
+        num_kv_heads,
+        seq_len,
+        head_size,
         scale,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=head_size,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=head_size,
         IS_CAUSAL=is_causal,
-        WINDOW_SIZE_PAST=window_size[0], WINDOW_SIZE_FUTURE=window_size[1],
+        WINDOW_SIZE_PAST=window_size[0],
+        WINDOW_SIZE_FUTURE=window_size[1],
     )
     # Output is already (B, S, H, D), no transpose needed
     return output, lse_output
+
 
 class GptOssAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -467,15 +511,11 @@ class GptOssAttention(nn.Module):
         causal = True
 
         if self.sliding_window is not None:
-            window_size=(self.sliding_window,) * 2
+            window_size = (self.sliding_window,) * 2
         else:
             window_size = (-1, -1)
 
-        query_states = query_states.transpose(1, 2).contiguous()
-        key_states = key_states.transpose(1, 2).contiguous()
-        value_states = value_states.transpose(1, 2).contiguous()
-
-        attn_class= xFuserLongContextAttention(attn_type=AttnType.TORCH)
+        attn_class = xFuserLongContextAttention(attn_type=AttnType.TORCH)
         attn_output = moreh_gpt_attention(
             attn_class,
             query_states,

@@ -1,9 +1,7 @@
-import math
 import unittest
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sp_group,
@@ -11,15 +9,12 @@ from xfuser.core.distributed import (
     initialize_model_parallel,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-from yunchang.comm.all_to_all import SeqAllToAll4D
 from yunchang.kernels import AttnType
-from yunchang.ring.utils import RingComm, update_out_and_lse
 
-from src.transformers.models.gpt_oss.ring_attention import torch_attention_with_sinks_forward, moreh_gpt_attention
+from src.transformers.models.gpt_oss.ring_attention import moreh_gpt_attention, torch_attention_with_sinks_forward
 
 
 class RingAttentionTest(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(2)
@@ -79,22 +74,28 @@ class RingAttentionTest(unittest.TestCase):
 
         causal = True
         window_size = (128, -1)
-        softmax_scale=head_dim ** -0.5
-        sinks = torch.full((num_heads,), float('-inf'), device=device, dtype=dtype)
+        softmax_scale = head_dim**-0.5
+        sinks = torch.full((num_heads,), float("-inf"), device=device, dtype=dtype)
         sinks = torch.randn_like(sinks)
 
-        vanila_output = torch_attention_with_sinks_forward(q_total, k_total, v_total, sinks, scale=softmax_scale,
-                                        is_causal=causal,
-                                        window_size=window_size)[0]
+        vanila_output = torch_attention_with_sinks_forward(
+            q_total_trans,
+            k_total_trans,
+            v_total_trans,
+            sinks,
+            scale=softmax_scale,
+            is_causal=causal,
+            window_size=window_size,
+        )[0]
 
         sdpa_output = vanila_output
 
-        attn_class= xFuserLongContextAttention(attn_type=AttnType.TORCH)
+        attn_class = xFuserLongContextAttention(attn_type=AttnType.TORCH)
         attn_output_local = moreh_gpt_attention(
             attn_class,
-            q_trans,
-            k_trans,
-            v_trans,
+            q,
+            k,
+            v,
             sinks,
             dropout_p=0.0,
             causal=causal,
@@ -102,7 +103,6 @@ class RingAttentionTest(unittest.TestCase):
         )
 
         attn_output = get_sp_group().all_gather(attn_output_local, dim=1)
-        attn_output = attn_output.view(batch_size, num_heads, total_seq_len, head_dim).contiguous()
 
         actual_output = attn_output.view(-1, total_seq_len, num_heads, head_dim)
         expected_output = sdpa_output.view(-1, total_seq_len, num_heads, head_dim)
@@ -144,7 +144,9 @@ class RingAttentionTest(unittest.TestCase):
             # The assertion still ensures the test fails correctly
             self.assertTrue(
                 is_close,
-                "The outputs of xFuser Ring Attention and PyTorch SDPA do not match. [See] detailed analysis above."
+                "The outputs of xFuser Ring Attention and PyTorch SDPA do not match. [See] detailed analysis above.",
             )
+
+
 if __name__ == "__main__":
     unittest.main()
