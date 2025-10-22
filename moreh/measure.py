@@ -77,7 +77,7 @@ def get_num_layers(model):
         raise ValueError("Unable to determine number of layers from model")
 
 
-def generate_module_names_for_stage(num_layers, pp_size, stage_idx):
+def generate_module_names_for_stage(num_layers, pp_size, stage_idx, split_points=None):
     """
     Generate module names for a specific pipeline stage.
 
@@ -85,16 +85,25 @@ def generate_module_names_for_stage(num_layers, pp_size, stage_idx):
         num_layers: Total number of transformer layers
         pp_size: Pipeline parallel size
         stage_idx: Index of the current stage
+        split_points: Optional list of custom split points (length must be pp_size-1)
 
     Returns:
         Tuple of (stage_modules, unused_modules):
             - stage_modules: List of module names needed for this stage
             - unused_modules: List of module names not needed for this stage
     """
-    assert num_layers % pp_size == 0, f"num_layers ({num_layers}) must be divisible by pp_size ({pp_size})"
-
-    layers_per_stage = num_layers // pp_size
-    start_layer = stage_idx * layers_per_stage
+    # Calculate layer range for this stage
+    if split_points is None:
+        # Uniform split
+        assert num_layers % pp_size == 0, f"num_layers ({num_layers}) must be divisible by pp_size ({pp_size})"
+        layers_per_stage = num_layers // pp_size
+        start_layer = stage_idx * layers_per_stage
+        end_layer = start_layer + layers_per_stage
+    else:
+        # Custom split using split_points
+        extended_points = [0] + split_points + [num_layers]
+        start_layer = extended_points[stage_idx]
+        end_layer = extended_points[stage_idx + 1]
 
     stage_modules = []
     unused_modules = []
@@ -110,7 +119,7 @@ def generate_module_names_for_stage(num_layers, pp_size, stage_idx):
 
     # Add transformer layers for this stage and mark others as unused
     for layer_idx in range(num_layers):
-        if start_layer <= layer_idx < start_layer + layers_per_stage:
+        if start_layer <= layer_idx < end_layer:
             stage_modules.append(f'model.layers.{layer_idx}')
         else:
             unused_modules.append(f'model.layers.{layer_idx}')
@@ -151,6 +160,8 @@ def build_stage_from_modules(
     Returns:
         Tuple of (PipelineStage, model_chunk)
     """
+
+    logger.info(f"Building stage {stage_idx} with modules: {module_names}")
 
     class IdentityModule(nn.Module):
         """Module that returns its first input unchanged (identity function)."""
@@ -395,6 +406,13 @@ def main():
         default=1,
         help="Number of iterations to measure performance"
     )
+    parser.add_argument(
+        "--pp-split-points",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Custom split points for pipeline parallel stages (must provide pp_size-1 values)."
+    )
 
     args = parser.parse_args()
 
@@ -405,13 +423,35 @@ def main():
         config = AutoConfig.from_pretrained(args.model)
         num_layers = config.num_hidden_layers
 
+        # Validate split points
+        split_points = args.pp_split_points
+        if split_points is not None:
+            # Check number of split points
+            if len(split_points) != args.pp_size - 1:
+                raise ValueError(
+                    f"Number of split points ({len(split_points)}) must equal pp_size - 1 ({args.pp_size - 1})"
+                )
+
+            # Check if split points are in ascending order
+            if split_points != sorted(split_points):
+                raise ValueError(
+                    f"Split points must be in ascending order, got: {split_points}"
+                )
+
+            # Check if all split points are within valid range
+            for point in split_points:
+                if point <= 0 or point >= num_layers:
+                    raise ValueError(
+                        f"Split point {point} is out of valid range (0, {num_layers})"
+                    )
+
         # Get pp_rank
         pp_mesh = device_mesh["pp"]
         pp_rank = pp_mesh.get_local_rank()
 
         # Generate module names for this stage
         stage_modules, unused_modules = generate_module_names_for_stage(
-            num_layers, args.pp_size, pp_rank
+            num_layers, args.pp_size, pp_rank, split_points
         )
 
         # Create device map: stage modules on device, unused on meta
