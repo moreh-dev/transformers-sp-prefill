@@ -321,9 +321,14 @@ def moreh_gpt_attention(
     key = key.transpose(1, 2).contiguous()
     value = value.transpose(1, 2).contiguous()
 
-    query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
-    key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
-    value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
 
     key_layer = key_layer.contiguous()
     value_layer = value_layer.contiguous()
@@ -386,6 +391,9 @@ def moreh_gpt_attention(
             value_layer = next_v
 
     out = out.to(query.dtype)
-    output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    else:
+        output = out
 
     return output
