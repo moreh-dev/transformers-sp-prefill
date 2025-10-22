@@ -330,9 +330,6 @@ def moreh_gpt_attention(
         key_layer = key
         value_layer = value
 
-    key_layer = key_layer.contiguous()
-    value_layer = value_layer.contiguous()
-
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
     comm = RingComm(module.ring_pg)
