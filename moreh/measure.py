@@ -20,6 +20,51 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def validate_args(args, config):
+    """Validate command-line arguments."""
+    # Check distributed mode requirements
+    is_distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+
+    if not is_distributed:
+        # Single device mode
+        if args.sp_size != 1 or args.pp_size != 1:
+            raise ValueError(
+                "Single device mode requires sp_size=1 and pp_size=1. Use torchrun for distributed execution."
+            )
+    else:
+        # Distributed mode
+        world_size = int(os.environ["WORLD_SIZE"])
+        expected_world_size = args.sp_size * args.pp_size
+        if world_size != expected_world_size:
+            raise ValueError(
+                f"World size ({world_size}) must equal SP size ({args.sp_size}) * PP size ({args.pp_size})"
+            )
+
+    # Validate split points for pipeline parallel
+    if args.pp_size > 1:
+        num_layers = config.num_hidden_layers
+        split_points = args.pp_split_points
+        if split_points is not None:
+            # Check number of split points
+            if len(split_points) != args.pp_size - 1:
+                raise ValueError(
+                    f"Number of split points ({len(split_points)}) must equal pp_size - 1 ({args.pp_size - 1})"
+                )
+
+            # Check if split points are in ascending order
+            if split_points != sorted(split_points):
+                raise ValueError(
+                    f"Split points must be in ascending order, got: {split_points}"
+                )
+
+            # Check if all split points are within valid range
+            for point in split_points:
+                if point <= 0 or point >= num_layers:
+                    raise ValueError(
+                        f"Split point {point} is out of valid range (0, {num_layers})"
+                    )
+
+
 def init_distributed(sp_size, pp_size):
     """Initialize distributed environment and create device mesh."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
@@ -28,10 +73,6 @@ def init_distributed(sp_size, pp_size):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         local_rank = int(os.environ["LOCAL_RANK"])
-        if world_size != sp_size * pp_size:
-            raise ValueError(
-                f"World size ({world_size}) must equal SP size ({sp_size}) * PP size ({pp_size})"
-            )
         torch.cuda.set_device(local_rank)
         mesh = torch.arange(world_size).reshape(sp_size, pp_size)
         device_mesh = DeviceMesh(device_type="cuda", mesh=mesh, mesh_dim_names=("sp", "pp"))
@@ -41,10 +82,6 @@ def init_distributed(sp_size, pp_size):
         return device, device_mesh
     else:
         # Single device mode
-        if sp_size != 1 or pp_size != 1:
-            raise ValueError(
-                "Single device mode requires sp_size=1 and pp_size=1. Use torchrun for distributed execution."
-            )
         device = torch.device("cuda:0")
         logger.info(f"Running in single device mode on {device}")
         return device, None
@@ -67,14 +104,6 @@ def load_model(model_id, device, device_map=None):
     )
 
     return tokenizer, model
-
-
-def get_num_layers(model):
-    """Get the number of transformer layers from the model."""
-    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-        return len(model.model.layers)
-    else:
-        raise ValueError("Unable to determine number of layers from model")
 
 
 def generate_module_names_for_stage(num_layers, pp_size, stage_idx, split_points=None):
@@ -230,13 +259,8 @@ def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
     Returns:
         Tuple of (pp_schedule, model_parts, has_first_stage, has_last_stage)
     """
-    pp_mesh = device_mesh["pp"]
-    pp_rank = pp_mesh.get_local_rank()
-    pp_size = pp_mesh.size()
-
-    num_layers = get_num_layers(model)
-
-    stage_idx = pp_rank
+    pp_size = device_mesh.size()
+    stage_idx = device_mesh.get_local_rank()
 
     stage, model_chunk = build_stage_from_modules(
         model,
@@ -244,7 +268,7 @@ def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
         pp_size,
         stage_modules,
         device,
-        pp_mesh.get_group(),
+        device_mesh.get_group(),
     )
 
     pp_schedule = _ScheduleForwardOnly(
@@ -257,6 +281,35 @@ def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
 
     # Return single stage in a list for consistency with torchtitan API
     return pp_schedule, [model_chunk], has_first_stage, has_last_stage
+
+
+def setup_pipeline_parallel_model(model_id, device, device_mesh, num_layers, split_points):
+    """Setup and load model with pipeline parallelism."""
+    # Generate module names for this stage
+    stage_modules, unused_modules = generate_module_names_for_stage(
+        num_layers, device_mesh.size(), device_mesh.get_local_rank(), split_points
+    )
+
+    # Create device map: stage modules on device, unused on meta
+    device_map = {**{x: device for x in stage_modules}, **{y: 'meta' for y in unused_modules}}
+
+    # Load model with device_map
+    tokenizer, model = load_model(model_id, device, device_map=device_map)
+
+    # Apply pipeline parallel
+    pp_schedule, model_parts, has_first_stage, has_last_stage = apply_pipeline_parallel(
+        model,
+        device_mesh,
+        device,
+        stage_modules,
+    )
+
+    # Clean up original model
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return tokenizer, pp_schedule, has_first_stage, has_last_stage
 
 
 def measure_performance(model, input_ids, output_sequence_lengths, num_iterations):
@@ -415,68 +468,23 @@ def main():
     )
 
     args = parser.parse_args()
+    config = AutoConfig.from_pretrained(args.model)
+
+    # Validate arguments
+    validate_args(args, config)
 
     # Initialize distributed environment
     device, device_mesh = init_distributed(args.sp_size, args.pp_size)
 
     if args.pp_size > 1:
-        config = AutoConfig.from_pretrained(args.model)
-        num_layers = config.num_hidden_layers
+        # Pipeline parallel mode
 
-        # Validate split points
-        split_points = args.pp_split_points
-        if split_points is not None:
-            # Check number of split points
-            if len(split_points) != args.pp_size - 1:
-                raise ValueError(
-                    f"Number of split points ({len(split_points)}) must equal pp_size - 1 ({args.pp_size - 1})"
-                )
-
-            # Check if split points are in ascending order
-            if split_points != sorted(split_points):
-                raise ValueError(
-                    f"Split points must be in ascending order, got: {split_points}"
-                )
-
-            # Check if all split points are within valid range
-            for point in split_points:
-                if point <= 0 or point >= num_layers:
-                    raise ValueError(
-                        f"Split point {point} is out of valid range (0, {num_layers})"
-                    )
-
-        # Get pp_rank
-        pp_mesh = device_mesh["pp"]
-        pp_rank = pp_mesh.get_local_rank()
-
-        # Generate module names for this stage
-        stage_modules, unused_modules = generate_module_names_for_stage(
-            num_layers, args.pp_size, pp_rank, split_points
+        # Setup pipeline parallel model
+        tokenizer, pp_schedule, has_first_stage, has_last_stage = setup_pipeline_parallel_model(
+            args.model, device, device_mesh["pp"], config.num_hidden_layers, args.pp_split_points
         )
 
-        # Create device map: stage modules on device, unused on meta
-        device_map = {**{x: device for x in stage_modules}, **{y: 'meta' for y in unused_modules}}
-
-        # Load model with device_map
-        tokenizer, model = load_model(args.model, device, device_map=device_map)
-
-        (
-            pp_schedule,
-            model_parts,
-            has_first_stage,
-            has_last_stage,
-        ) = apply_pipeline_parallel(
-            model,
-            device_mesh,
-            device,
-            stage_modules,
-        )
-
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        # Generate input_ids once
+        # Generate input_ids
         if has_first_stage:
             input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
         else:
@@ -485,17 +493,12 @@ def main():
         # Measure performance
         with torch.autograd.grad_mode.inference_mode():
             results = measure_pipeline_parallel_performance(
-                pp_schedule,
-                has_first_stage,
-                input_ids,
-                args.output_lengths,
-                args.num_iterations
+                pp_schedule, has_first_stage, input_ids, args.output_lengths, args.num_iterations
             )
 
     else:
         # Single device mode
         tokenizer, model = load_model(args.model, device)
-
         model = torch.compile(model)
         input_ids = torch.randint(0, tokenizer.vocab_size, (1, args.input_length)).to(device)
         results = measure_performance(model, input_ids, args.output_lengths, args.num_iterations)
