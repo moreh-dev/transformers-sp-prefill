@@ -374,17 +374,16 @@ def moreh_gpt_attention(
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
                 attn_done_local[0] = True
 
-        dist.all_reduce(attn_done_local, op=dist.ReduceOp.SUM)
+        #from xfuser.core.distributed import get_sp_group
+        dist.all_reduce(attn_done_local, op=dist.ReduceOp.SUM, group=comm._process_group)
 
         if attn_done_local.item() == 0:
-            print(f"rank {comm.rank} early terminating at step {step}")
             break
 
         if step + 1 != comm.world_size:
             comm.wait()
             key_layer = next_k
             value_layer = next_v
-
     out = out.to(query.dtype)
     output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
 

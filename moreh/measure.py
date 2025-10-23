@@ -3,13 +3,23 @@ import gc
 import logging
 import os
 import time
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.pipelining import PipelineStage
 from torch.distributed.pipelining.schedules import _ScheduleForwardOnly
+
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
+
+from xfuser.core.distributed import (
+    get_sp_group,
+    get_pp_group,
+    init_distributed_environment,
+    initialize_model_parallel,
+)
 
 
 logging.basicConfig(
@@ -18,6 +28,25 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+def prepare_input(vocab_size, input_length, device, device_mesh):
+    if device_mesh is not None:
+        pp_mesh = device_mesh["pp"]
+        sp_mesh = device_mesh["sp"]
+        pp_rank = pp_mesh.get_local_rank()
+        if pp_rank > 0:
+            return None
+        pp_size = pp_mesh.size()
+        sp_size = sp_mesh.size()
+        sp_rank = sp_mesh.get_local_rank()
+        input_ids = torch.randint(0, vocab_size, (pp_size, input_length)).to(device)
+        if sp_size > 1:
+            dist.broadcast(input_ids, group=sp_mesh.get_group(), group_src=0)
+            input_ids = input_ids.chunk(sp_size, dim=1)[sp_rank]
+        return input_ids
+    else:
+        return torch.randint(0, vocab_size, (1, input_length)).to(device)
 
 
 def validate_args(args, config):
@@ -74,9 +103,30 @@ def init_distributed(sp_size, pp_size):
         world_size = dist.get_world_size()
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        mesh = torch.arange(world_size).reshape(sp_size, pp_size)
-        device_mesh = DeviceMesh(device_type="cuda", mesh=mesh, mesh_dim_names=("sp", "pp"))
         device = torch.device(f"cuda:{local_rank}")
+
+        init_distributed_environment(
+            rank=rank,
+            world_size=world_size,
+        )
+        initialize_model_parallel(
+            sequence_parallel_degree=sp_size,
+            ring_degree=sp_size,
+            ulysses_degree=1,
+            pipeline_parallel_degree=pp_size,
+        )
+
+        pp_group = get_pp_group()
+        sp_group = get_sp_group()
+        mesh = torch.arange(world_size).reshape(pp_size, sp_size)
+
+        device_mesh = DeviceMesh.from_group(
+            group=[pp_group.device_group, sp_group.device_group],
+            device_type='cuda',
+            mesh=mesh,
+            mesh_dim_names=("pp", "sp")
+        )
+
         logger.info(f"Rank {rank}/{world_size} | Local rank: {local_rank} | Device: {device}")
         logger.info(f"Device mesh created: {device_mesh}")
         return device, device_mesh
@@ -476,6 +526,8 @@ def main():
     # Initialize distributed environment
     device, device_mesh = init_distributed(args.sp_size, args.pp_size)
 
+    input_ids = prepare_input(config.vocab_size, args.input_length, device, device_mesh)
+
     if args.pp_size > 1:
         # Pipeline parallel mode
 
@@ -483,12 +535,6 @@ def main():
         tokenizer, pp_schedule, has_first_stage, has_last_stage = setup_pipeline_parallel_model(
             args.model, device, device_mesh["pp"], config.num_hidden_layers, args.pp_split_points
         )
-
-        # Generate input_ids
-        if has_first_stage:
-            input_ids = torch.randint(0, tokenizer.vocab_size, (args.pp_size, args.input_length)).to(device)
-        else:
-            input_ids = None
 
         # Measure performance
         with torch.autograd.grad_mode.inference_mode():
@@ -500,7 +546,6 @@ def main():
         # Single device mode
         tokenizer, model = load_model(args.model, device)
         model = torch.compile(model)
-        input_ids = torch.randint(0, tokenizer.vocab_size, (1, args.input_length)).to(device)
         results = measure_performance(model, input_ids, args.output_lengths, args.num_iterations)
 
     print_summary(results)
