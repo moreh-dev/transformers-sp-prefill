@@ -4,9 +4,98 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+import yunchang.comm.extract_local
 from yunchang.comm.all_to_all import SeqAllToAll4D
+from yunchang.globals import PROCESS_GROUP
 from yunchang.kernels import AttnType
 from yunchang.ring.utils import RingComm, update_out_and_lse
+
+
+def zigzag_extract_local_patched(value, rank, world_size, rd, ud, dim=1, *args, **kwargs):
+    """
+    value is a tensor of shape (bs, seqlen, ...)
+    """
+    input_dim = value.dim()
+    assert input_dim >= 2
+
+    shape = list(value.shape)
+    seqlen = shape[dim]
+
+    value_chunks = value.chunk(2 * rd, dim=dim)
+
+    r_rank = dist.get_rank(group=PROCESS_GROUP.RING_PG)
+    u_rank = dist.get_rank(group=PROCESS_GROUP.ULYSSES_PG)
+
+    assert dist.get_world_size(group=PROCESS_GROUP.RING_PG) == rd
+    assert dist.get_world_size(group=PROCESS_GROUP.ULYSSES_PG) == ud
+
+    local_value = torch.cat([value_chunks[r_rank], value_chunks[2 * rd - r_rank - 1]], dim=dim).chunk(ud, dim=dim)[
+        u_rank
+    ]
+
+    new_shape = shape
+    new_shape[dim] = seqlen // world_size
+    return local_value.reshape(new_shape).contiguous()
+
+
+def all_gather_zigzag(local_tensor, rd, ud, dim=1, *args, **kwargs):
+    """
+    Inverse of zigzag_extract_local_patched (All-Gather with Reordering).
+    """
+
+    ring_pg = PROCESS_GROUP.RING_PG
+    ulysses_pg = PROCESS_GROUP.ULYSSES_PG
+    r_rank = dist.get_rank(group=ring_pg)
+
+    # --- 1. ulysses All-Gather ---
+
+    # (B, H, S_local, D) -> (S_local, H, B, D)
+    local_tensor_trans = local_tensor.transpose(0, dim).contiguous()
+
+    # out shape (S_local*ud, H, B, D)
+    shape_trans = list(local_tensor_trans.shape)
+    shape_trans[0] *= ud
+    concatenated_chunk_trans = torch.empty(shape_trans, dtype=local_tensor.dtype, device=local_tensor.device)
+
+    dist.all_gather_into_tensor(concatenated_chunk_trans, local_tensor_trans, group=ulysses_pg)
+
+    # (S_local*ud, H, B, D) -> (B, H, S_local*ud, D)
+    concatenated_chunk = concatenated_chunk_trans.transpose(0, dim).contiguous()
+
+    # --- 2. Chunk Split ---
+    chunk_O_r, chunk_O_other = concatenated_chunk.chunk(2, dim=dim)
+
+    chunk_O_r = chunk_O_r.contiguous()
+    chunk_O_other = chunk_O_other.contiguous()
+
+    # --- 3. Ring All-Gather ---
+
+    # first half chunks
+    chunk_O_r_trans = chunk_O_r.transpose(0, dim).contiguous()
+    shape_r_trans = list(chunk_O_r_trans.shape)
+    shape_r_trans[0] *= rd
+    gathered_O_r_trans = torch.empty(shape_r_trans, dtype=local_tensor.dtype, device=local_tensor.device)
+    dist.all_gather_into_tensor(gathered_O_r_trans, chunk_O_r_trans, group=ring_pg)
+    gathered_O_r = gathered_O_r_trans.transpose(0, dim).contiguous()
+
+    # second half chunks
+    chunk_O_other_trans = chunk_O_other.transpose(0, dim).contiguous()
+    shape_other_trans = list(chunk_O_other_trans.shape)
+    shape_other_trans[0] *= rd
+    gathered_O_other_trans = torch.empty(shape_other_trans, dtype=local_tensor.dtype, device=local_tensor.device)
+    dist.all_gather_into_tensor(gathered_O_other_trans, chunk_O_other_trans, group=ring_pg)
+    gathered_O_other = gathered_O_other_trans.transpose(0, dim).contiguous()
+
+    # --- 4. Final Assembly ---
+    other_chunks_list = gathered_O_other.chunk(rd, dim=dim)
+    gathered_O_other_reversed = torch.cat(list(reversed(other_chunks_list)), dim=dim)
+
+    global_tensor = torch.cat([gathered_O_r, gathered_O_other_reversed], dim=dim)
+
+    return global_tensor.contiguous()
+
+
+yunchang.comm.extract_local.EXTRACT_FUNC_DICT["zigzag"] = zigzag_extract_local_patched
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -28,7 +117,7 @@ def torch_attention_with_sinks_forward(
     sinks: torch.Tensor,
     scale: float,
     is_causal: bool,
-    window_size: tuple[int, int],
+    window_size: tuple[int, int] = (-1, -1),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, seq_len, num_query_heads, head_size = query.shape
     _, _, num_kv_heads, _ = key.shape
@@ -381,6 +470,122 @@ def moreh_gpt_attention(
         if attn_done_local.item() == 0:
             print(f"rank {comm.rank} early terminating at step {step}")
             break
+
+        if step + 1 != comm.world_size:
+            comm.wait()
+            key_layer = next_k
+            value_layer = next_v
+
+    out = out.to(query.dtype)
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    else:
+        output = out
+
+    return output
+
+
+def moreh_gpt_attention_balanced(
+    module,
+    query,
+    key,
+    value,
+    sinks,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    is_kernel_bhsd: bool = True,
+) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert module.attn_type == AttnType.TORCH
+    assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
+
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
+    comm = RingComm(module.ring_pg)
+
+    assert causal, "Balanced Ring Attention requires causal=True"
+    block_seq_len = query_layer.shape[1] // 2
+    query1 = query_layer[:, block_seq_len:]
+
+    out = None
+    lse = None
+
+    next_k, next_v = None, None
+
+    if comm.rank == 3:
+        breakpoint()
+    else:
+        while True:
+            pass
+    for step in range(comm.world_size):
+        if step + 1 != comm.world_size:
+            next_k: torch.Tensor = comm.send_recv(key_layer)
+            next_v: torch.Tensor = comm.send_recv(value_layer)
+            comm.commit()
+
+        key, value = key_layer, value_layer
+
+        if step == 0:
+            block_out, block_lse, _ = triton_attention_forward(
+                query_layer,
+                key,
+                value,
+                sinks,
+                scale=softmax_scale,
+                is_causal=causal,
+                window_size=window_size,
+            )
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
+        elif step <= comm.rank:
+            key0 = key[:, :block_seq_len]
+            value0 = value[:, :block_seq_len]
+
+            if key0.shape[1] > 0:
+                block_out, block_lse, _ = triton_attention_forward(
+                    query_layer,
+                    key0,
+                    value0,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=False,
+                    window_size=window_size,
+                )
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
+        else:
+            block_out, block_lse, _ = triton_attention_forward(
+                query1,
+                key,
+                value,
+                sinks,
+                scale=softmax_scale,
+                is_causal=False,
+                window_size=window_size,
+            )
+            out, lse = update_out_and_lse(
+                out,
+                lse,
+                block_out,
+                block_lse,
+                slice_=(slice(None), slice(block_seq_len, None)),
+            )
 
         if step + 1 != comm.world_size:
             comm.wait()
