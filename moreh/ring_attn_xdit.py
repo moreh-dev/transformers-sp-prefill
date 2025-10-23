@@ -23,14 +23,14 @@ def setup_distributed():
     ring_size = world_size
     ulysses_size = world_size // ring_size
 
-    init_distributed_environment(
-            rank=dist.get_rank(), world_size=dist.get_world_size())
+    init_distributed_environment(rank=dist.get_rank(), world_size=dist.get_world_size())
 
     initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
-            ring_degree=ring_size,
-            ulysses_degree=ulysses_size,
+        sequence_parallel_degree=dist.get_world_size(),
+        ring_degree=ring_size,
+        ulysses_degree=ulysses_size,
     )
+
 
 def main():
     # 1. Set up the distributed environment
@@ -53,14 +53,14 @@ def main():
     # The model code itself MUST have the Ring Attention logic implemented.
     # We are NOT using device_map here.
 
-    isl = 1024 * 2
+    isl = 1024 * 8
     input_ids = torch.randint(0, tokenizer.vocab_size, (1, isl)).to(device)
     dist.broadcast(input_ids, src=0)
 
     local_input_ids = torch.empty(1, isl // world_size, dtype=input_ids.dtype).to(device)
 
     if rank == 0:
-        print (input_ids)
+        print(input_ids)
         print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
@@ -69,12 +69,12 @@ def main():
     )
     model.eval()
 
-    #num_layers = len(model.model.layers)
-    #model.model.layers = model.model.layers[:num_layers//4]
-    #del(model.model.layers[num_layers//4:])
-    #import gc
-    #gc.collect()
-    #torch.cuda.empty_cache()
+    # num_layers = len(model.model.layers)
+    # model.model.layers = model.model.layers[:num_layers//4]
+    # del(model.model.layers[num_layers//4:])
+    # import gc
+    # gc.collect()
+    # torch.cuda.empty_cache()
 
     # torch.compile can be added here if desired, but test without it first.
     model = torch.compile(model)
@@ -85,14 +85,13 @@ def main():
             print(f"Error: Input sequence length {isl} is not divisible by world_size {world_size}.")
         return
 
-
     if rank == 0:
         dist.scatter(local_input_ids, list(input_ids.chunk(world_size, 1)), src=0)
     else:
         dist.scatter(local_input_ids, None, src=0)
 
     # The output sequence length for the benchmark
-    osl = 1 # Example fixed output length
+    osl = 1  # Example fixed output length
 
     # --- Warm-up Run ---
     if rank == 0:
@@ -120,11 +119,7 @@ def main():
 
     start_time = time.time()
 
-    _ = model.generate(
-        local_input_ids,
-        max_new_tokens=osl,
-        do_sample=False
-    )
+    _ = model.generate(local_input_ids, max_new_tokens=osl, do_sample=False)
 
     # Synchronize after timing
     torch.cuda.synchronize()
@@ -143,6 +138,7 @@ def main():
         print(f"World Size:    {world_size} GPUs")
         print(f"Total Time:    {elapsed_time:.4f} seconds")
         print(f"Throughput:    {tokens_per_second:.2f} tokens/sec")
+
 
 if __name__ == "__main__":
     main()
