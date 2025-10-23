@@ -18,11 +18,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from xfuser.core.distributed import (
+    get_sequence_parallel_rank,
+    get_sp_group,
+)
+from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+from yunchang.kernels import AttnType
 
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -31,11 +37,12 @@ from ...masking_utils import create_causal_mask, create_sliding_window_causal_ma
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import MoeCausalLMOutputWithPast, MoeModelOutputWithPast
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
-from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ...modeling_utils import PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
+from .ring_attention import moreh_gpt_attention
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -180,6 +187,10 @@ class GptOssRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
+        sp_rank = get_sequence_parallel_rank()
+        local_seq_len = int(position_ids.shape[-1])
+        position_ids += sp_rank * local_seq_len
+
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -306,26 +317,28 @@ class GptOssAttention(nn.Module):
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        causal = True
 
-        attn_output, attn_weights = attention_interface(
-            self,
+        if self.sliding_window is not None:
+            window_size = (self.sliding_window,) * 2
+        else:
+            window_size = (-1, -1)
+
+        attn_class = xFuserLongContextAttention(attn_type=AttnType.TORCH)
+        attn_output = moreh_gpt_attention(
+            attn_class,
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,  # diff with Llama
-            **kwargs,
+            self.sinks,
+            dropout_p=0.0 if not self.training else self.attention_dropout,
+            causal=causal,
+            window_size=window_size,
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output
 
 
 class GptOssDecoderLayer(GradientCheckpointingLayer):
@@ -352,7 +365,7 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, _ = self.self_attn(
+        hidden_states = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -499,6 +512,7 @@ class GptOssModel(GptOssPreTrainedModel):
                 **kwargs,
             )
         hidden_states = self.norm(hidden_states)
+        hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
         return hidden_states
 
 
