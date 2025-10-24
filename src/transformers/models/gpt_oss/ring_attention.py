@@ -238,6 +238,8 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
     batch_size, seq_len, num_query_heads, head_size = query.shape
     _, _, num_kv_heads, _ = key.shape
 
+    assert sinks.numel() == num_query_heads
+
     output = torch.empty_like(query)
     # LSE shape: (B, H, S)
     lse_output = torch.empty((batch_size, num_query_heads, seq_len), dtype=torch.float32, device=query.device)
@@ -321,10 +323,14 @@ def moreh_gpt_attention(
     key = key.transpose(1, 2).contiguous()
     value = value.transpose(1, 2).contiguous()
 
-    if dist.get_world_size(module.ulysses_pg) > 1:
+    ulysses_size = dist.get_world_size(module.ulysses_pg)
+
+    if ulysses_size > 1:
         query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
         key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
         value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+        ulysses_rank = dist.get_rank(module.ulysses_pg)
+        sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
     else:
         query_layer = query
         key_layer = key
