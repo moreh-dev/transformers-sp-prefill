@@ -457,6 +457,7 @@ def moreh_gpt_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
     comm = RingComm(module.ring_pg)
+    assert comm.world_size == 8, "Early stop assumes ring world_size=8."
 
     out = None
     lse = None
@@ -468,9 +469,11 @@ def moreh_gpt_attention(
     chunk_len = query_layer.shape[1]
 
     for step in range(comm.world_size):
-        if window_size[0] != -1 and step > 1:
+        current_is_early_stop = window_size[0] != -1 and step == 2
+        next_is_early_stop = window_size[0] != -1 and step == 1
+        if current_is_early_stop:
             break
-        if step + 1 != comm.world_size:
+        if step + 1 != comm.world_size and not next_is_early_stop:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
             comm.commit()
@@ -498,7 +501,7 @@ def moreh_gpt_attention(
 
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
-        if step + 1 != comm.world_size:
+        if step + 1 != comm.world_size and not next_is_early_stop:
             comm.wait()
             key_layer = next_k
             value_layer = next_v
