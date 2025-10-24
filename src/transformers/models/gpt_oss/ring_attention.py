@@ -433,8 +433,8 @@ def moreh_gpt_attention(
     chunk_len = query_layer.shape[1]
 
     for step in range(comm.world_size):
-        attn_done_local = torch.zeros(1, device=query.device, dtype=torch.int32)
-
+        if window_size[0] != -1 and step > 1:
+            break
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
@@ -461,15 +461,7 @@ def moreh_gpt_attention(
                 window_size=adjusted_window_size,
             )
 
-            if not all_masked:
-                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
-                attn_done_local[0] = True
-
-        dist.all_reduce(attn_done_local, op=dist.ReduceOp.SUM)
-
-        if attn_done_local.item() == 0:
-            print(f"rank {comm.rank} early terminating at step {step}")
-            break
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         if step + 1 != comm.world_size:
             comm.wait()
