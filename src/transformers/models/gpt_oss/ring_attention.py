@@ -5,6 +5,9 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 import yunchang.comm.extract_local
+from xfuser.core.distributed import (
+    get_sp_group,
+)
 from yunchang.comm.all_to_all import SeqAllToAll4D
 from yunchang.globals import PROCESS_GROUP
 from yunchang.kernels import AttnType
@@ -212,7 +215,9 @@ def kernel_attention_contiguous(
     stride_v_head,
     num_query_heads,
     num_kv_heads,
-    seq_len,
+    # MODIFIED: q_seq_len and kv_seq_len
+    q_seq_len,
+    kv_seq_len,
     head_size,
     scale,
     BLOCK_M: tl.constexpr,
@@ -245,29 +250,34 @@ def kernel_attention_contiguous(
     m_i = tl.full([BLOCK_M], sink_val, tl.float32)
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
 
-    # NEW: Initialize all_masked flag to 1 (True).
-    # It will be set to 0 if any valid attention score is found.
     all_masked_flag = 1
 
-    q_mask = offs_m < seq_len
+    # MODIFIED: Use q_seq_len for query masking
+    q_mask = offs_m < q_seq_len
     q = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
     q = (q * scale).to(q.dtype)
 
-    end_n = seq_len
-    if IS_CAUSAL:
-        end_n = start_m + BLOCK_M
+    # MODIFIED: Loop boundary is always kv_seq_len.
+    # The 'if IS_CAUSAL' optimization is removed as it's only valid for self-attention.
+    end_n = kv_seq_len
 
     start_n = 0
     while start_n < end_n:
         offs_n = start_n + tl.arange(0, BLOCK_N)
         k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
-        k_mask = offs_n[None, :] < seq_len
+
+        # MODIFIED: Use kv_seq_len for key masking
+        k_mask = offs_n[None, :] < kv_seq_len
         k = tl.load(k_ptrs, mask=k_mask, other=0.0)
 
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
 
-        mask = q_mask[:, None] & (offs_n[None, :] < end_n)
+        # MODIFIED: Use kv_seq_len for attention masking
+        mask = q_mask[:, None] & (offs_n[None, :] < kv_seq_len)
+
+        # NOTE: This causal mask logic is still correct for cross-attention
+        # if offs_m and offs_n represent absolute positions.
         if IS_CAUSAL:
             mask = mask & (offs_m[:, None] >= offs_n[None, :])
 
@@ -285,9 +295,6 @@ def kernel_attention_contiguous(
         p = tl.exp(qk - m_ij[:, None])
         l_j = tl.sum(p, 1)
 
-        # NEW: Check if any attention was computed in this block.
-        # If the sum of probabilities `p` is greater than 0,
-        # it means at least one logit was not -inf.
         if tl.sum(p) > 0.0:
             all_masked_flag = 0
 
@@ -295,7 +302,8 @@ def kernel_attention_contiguous(
         acc = acc * alpha[:, None]
 
         v_ptrs = v_ptrs_base + (offs_n[:, None] * stride_v_seq + offs_d[None, :])
-        v_mask = offs_n[:, None] < seq_len
+        # MODIFIED: Use kv_seq_len for value masking
+        v_mask = offs_n[:, None] < kv_seq_len
         v = tl.load(v_ptrs, mask=v_mask, other=0.0)
 
         acc += tl.dot(p.to(v.dtype), v)
@@ -305,15 +313,17 @@ def kernel_attention_contiguous(
 
         start_n += BLOCK_N
 
-    # NEW: Store the all_masked flag for the current program instance.
+    # Store the all_masked flag (no change)
     pid_m_block = tl.program_id(2)
     all_masked_out_ptr = all_masked_ptr + batch_idx * stride_am_batch + head_idx * stride_am_head + pid_m_block
     tl.store(all_masked_out_ptr, all_masked_flag)
 
+    # Store LSE (uses q_mask, which is based on q_seq_len, so this is correct)
     lse = m_i + tl.log(l_i)
     lse_ptrs = lse_ptr + (batch_idx * stride_lse_batch + head_idx * stride_lse_head + offs_m)
     tl.store(lse_ptrs, lse, mask=q_mask)
 
+    # Store Output (uses q_mask, so this is correct)
     acc = acc / l_i[:, None]
     out_ptrs = output_ptr + (
         batch_idx * stride_out_batch + offs_m[:, None] * stride_out_seq + head_idx * stride_out_head + offs_d[None, :]
@@ -321,22 +331,27 @@ def kernel_attention_contiguous(
     tl.store(out_ptrs, acc, mask=q_mask[:, None])
 
 
-# --- MODIFIED Python Wrapper for Triton Kernel ---
 def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, window_size: tuple):
-    # Input shapes: (B, S, H, D)
-    batch_size, seq_len, num_query_heads, head_size = query.shape
-    _, _, num_kv_heads, _ = key.shape
+    # Input shapes: Q(B, Sq, Hq, D), K(B, Skv, Hkv, D), V(B, Skv, Hkv, D)
+
+    # MODIFIED: Get q_seq_len from query
+    batch_size, q_seq_len, num_query_heads, head_size = query.shape
+    # MODIFIED: Get kv_seq_len from key
+    _, kv_seq_len, num_kv_heads, _ = key.shape
 
     output = torch.empty_like(query)
-    # LSE shape: (B, H, S)
-    lse_output = torch.empty((batch_size, num_query_heads, seq_len), dtype=torch.float32, device=query.device)
+
+    # MODIFIED: LSE shape is (B, Hq, Sq)
+    lse_output = torch.empty((batch_size, num_query_heads, q_seq_len), dtype=torch.float32, device=query.device)
 
     BLOCK_M = 16
     BLOCK_N = 64
 
-    grid = (batch_size, num_query_heads, triton.cdiv(seq_len, BLOCK_M))
+    # MODIFIED: Grid's 3rd dimension depends on q_seq_len
+    grid = (batch_size, num_query_heads, triton.cdiv(q_seq_len, BLOCK_M))
 
     # Create a tensor to store the all_masked flag for each program in the grid.
+    # Its shape matches the grid, so this is correct.
     all_masked_output = torch.empty(grid, dtype=torch.int32, device=query.device)
 
     kernel_attention_contiguous[grid](
@@ -347,32 +362,34 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
         key,
         value,
         sinks,
-        # Strides for Output (B, S, H, D)
+        # Strides for Output (B, Sq, Hq, D)
         output.stride(0),
         output.stride(1),
         output.stride(2),
-        # Strides for LSE (B, H, S)
+        # Strides for LSE (B, Hq, Sq)
         lse_output.stride(0),
         lse_output.stride(1),
         lse_output.stride(2),
         # Strides for all_masked (matches grid shape)
         all_masked_output.stride(0),
         all_masked_output.stride(1),
-        # Strides for Q (B, S, H, D)
+        # Strides for Q (B, Sq, Hq, D)
         query.stride(0),
         query.stride(1),
         query.stride(2),
-        # Strides for K (B, S, H_kv, D)
+        # Strides for K (B, Skv, Hkv, D)
         key.stride(0),
         key.stride(1),
         key.stride(2),
-        # Strides for V (B, S, H_kv, D)
+        # Strides for V (B, Skv, Hkv, D)
         value.stride(0),
         value.stride(1),
         value.stride(2),
         num_query_heads,
         num_kv_heads,
-        seq_len,
+        # MODIFIED: Pass both q_seq_len and kv_seq_len
+        q_seq_len,
+        kv_seq_len,
         head_size,
         scale,
         BLOCK_M=BLOCK_M,
@@ -383,8 +400,6 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
         WINDOW_SIZE_FUTURE=window_size[1],
     )
 
-    # MODIFIED: Return the all_masked_output tensor as a boolean tensor.
-    # The int32 tensor (1 for masked, 0 for not) is converted to bool (True for masked, False for not).
     all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
 
     return output, lse_output, all_masked_scalar
@@ -467,6 +482,59 @@ def moreh_gpt_attention(
             comm.wait()
             key_layer = next_k
             value_layer = next_v
+
+    out = out.to(query.dtype)
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    else:
+        output = out
+
+    return output
+
+
+def moreh_gpt_attention_aggregated(
+    module,
+    query,
+    key,
+    value,
+    sinks,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    is_kernel_bhsd: bool = True,
+) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert module.attn_type == AttnType.TORCH
+
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
+
+    key_gathered = get_sp_group().all_gather(key_layer, dim=1)
+    value_gathered = get_sp_group().all_gather(value_layer, dim=1)
+    out = triton_attention_forward(
+        query_layer,
+        key_gathered,
+        value_gathered,
+        sinks,
+        scale=softmax_scale,
+        is_causal=causal,
+        window_size=window_size,
+    )[0]
 
     out = out.to(query.dtype)
     if dist.get_world_size(module.ulysses_pg) > 1:
