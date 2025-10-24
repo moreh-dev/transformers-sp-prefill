@@ -457,7 +457,7 @@ def moreh_gpt_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
     comm = RingComm(module.ring_pg)
-    assert comm.world_size == 8, "Early stop assumes ring world_size=8."
+    assert comm.world_size <= 16, "Ring Attention only supports up to 16 devices."
 
     out = None
     lse = None
