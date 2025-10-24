@@ -320,6 +320,7 @@ def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
         device,
         device_mesh.get_group(),
     )
+    model_chunk.eval()
 
     pp_schedule = _ScheduleForwardOnly(
         stage,

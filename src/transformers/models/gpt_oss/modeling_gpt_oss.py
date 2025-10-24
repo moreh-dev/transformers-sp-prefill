@@ -24,6 +24,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from xfuser.core.distributed import (
+    get_pp_group,
     get_sequence_parallel_rank,
     get_sp_group,
 )
@@ -511,8 +512,11 @@ class GptOssModel(GptOssPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+
         hidden_states = self.norm(hidden_states)
-        hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+        if get_pp_group().is_last_rank:
+            hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+
         return hidden_states
 
 
