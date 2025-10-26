@@ -45,7 +45,6 @@ def all_gather_zigzag(local_tensor, rd, ud, dim=1, *args, **kwargs):
 
     ring_pg = PROCESS_GROUP.RING_PG
     ulysses_pg = PROCESS_GROUP.ULYSSES_PG
-    r_rank = dist.get_rank(group=ring_pg)
 
     # --- 1. ulysses All-Gather ---
 
@@ -194,7 +193,7 @@ for block_q in [8, 16, 32]:
     key=["q_seq_len", "kv_seq_len", "HEAD_SIZE"],
 )
 @triton.jit
-def kernel_attention_contiguous_v3(
+def kernel_attention_contiguous_vllm_ported(
     output_ptr,
     lse_ptr,
     all_masked_ptr,
@@ -202,7 +201,8 @@ def kernel_attention_contiguous_v3(
     key_ptr,
     value_ptr,
     sinks_ptr,
-    # Strides
+    alibi_slopes_ptr,  # [num_query_heads]
+    qq_bias_ptr,  # [q_seq_len, q_seq_len]
     stride_out_batch,
     stride_out_seq,
     stride_out_head,
@@ -220,46 +220,44 @@ def kernel_attention_contiguous_v3(
     stride_v_batch,
     stride_v_seq,
     stride_v_head,
-    # Dims
+    qq_bias_stride_0,  # int (qq_bias.stride(0))
     q_seq_len,
     kv_seq_len,
     scale,
-    # === Constexpr (수정된 부분) ===
-    # 1. Autotuner가 주입할 인자들 (이게 빠졌었습니다)
+    k_scale,  # float32
+    v_scale,  # float32
+    out_scale,  # float32
     BLOCK_Q_PER_HEAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    # 2. Python 래퍼가 전달할 인자들
     NUM_QUERIES_PER_KV: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
     HEAD_SIZE_PADDED: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     WINDOW_SIZE_PAST: tl.constexpr,
     WINDOW_SIZE_FUTURE: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    USE_QQ_BIAS: tl.constexpr,
 ):
     BLOCK_M_FUSED: tl.constexpr = BLOCK_Q_PER_HEAD * NUM_QUERIES_PER_KV
-    # --- (커널의 나머지 로직은 동일) ---
+
     batch_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    # --- 1. GQA Fused Indexing (vLLM 방식) ---
     start_m_q_pos = tl.program_id(2) * BLOCK_Q_PER_HEAD
     offs_m_fused = tl.arange(0, BLOCK_M_FUSED)
     offs_q_pos = start_m_q_pos + (offs_m_fused // NUM_QUERIES_PER_KV)
     offs_q_head_offset = offs_m_fused % NUM_QUERIES_PER_KV
     head_idx = kv_head_idx * NUM_QUERIES_PER_KV + offs_q_head_offset
 
-    # --- K/V 포인터 베이스 ---
     k_ptrs_base = key_ptr + (batch_idx * stride_k_batch + kv_head_idx * stride_k_head)
     v_ptrs_base = value_ptr + (batch_idx * stride_v_batch + kv_head_idx * stride_v_head)
 
-    # --- 오프셋 및 마스크 ---
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     d_mask = offs_d < HEAD_SIZE
     d_mask_q_v = d_mask[None, :]
     d_mask_k = d_mask[:, None]
     q_mask = offs_q_pos < q_seq_len
 
-    # --- Q 포인터 ---
     q_ptrs = (
         query_ptr
         + batch_idx * stride_q_batch
@@ -268,53 +266,59 @@ def kernel_attention_contiguous_v3(
         + offs_d[None, :]
     )
 
-    # --- 상태 초기화 ---
     acc = tl.zeros([BLOCK_M_FUSED, HEAD_SIZE_PADDED], dtype=tl.float32)
     m_i = tl.load(sinks_ptr + head_idx, mask=q_mask, other=float("-inf")).to(tl.float32)
     l_i = tl.full([BLOCK_M_FUSED], 1.0, dtype=tl.float32)
     all_masked_flag = 1
 
-    # --- Q 로드 ---
     q = tl.load(q_ptrs, mask=q_mask[:, None] & d_mask_q_v, other=0.0)
     q = (q * scale).to(q.dtype)
 
-    # --- K/V 순회 루프 ---
+    if USE_ALIBI_SLOPES:
+        alibi_slope = tl.load(alibi_slopes_ptr + head_idx, mask=q_mask, other=0.0)
+
+    if USE_QQ_BIAS:
+        qq_bias_row_ptrs = qq_bias_ptr + offs_q_pos[:, None] * qq_bias_stride_0
+
     end_n = kv_seq_len
     start_n = 0
     while start_n < end_n:
         offs_n = start_n + tl.arange(0, BLOCK_N)
-
-        # K 로드
-        k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
         k_mask = offs_n[None, :] < kv_seq_len
-        k = tl.load(k_ptrs, mask=k_mask & d_mask_k, other=0.0)
 
-        # QK 계산
+        k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
+        k_load = tl.load(k_ptrs, mask=k_mask & d_mask_k, other=0.0)
+
+        k = k_load
+
         qk = tl.zeros([BLOCK_M_FUSED, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
 
-        # --- 마스킹 로직 ---
+        if USE_ALIBI_SLOPES:
+            alibi_bias = alibi_slope[:, None] * offs_n[None, :]
+            qk += alibi_bias
+
+        if USE_QQ_BIAS:
+            key_pos = offs_n[None, :]
+            qq_bias_mask = (key_pos >= 0) & (key_pos < q_seq_len)
+            qq_bias = tl.load(qq_bias_row_ptrs + key_pos, mask=qq_bias_mask & q_mask[:, None], other=0.0)
+            qk += qq_bias
+
         mask = q_mask[:, None] & (offs_n[None, :] < kv_seq_len)
         if IS_CAUSAL:
-            # (수정) offs_m_fused가 아닌 offs_q_pos를 사용해야 함
             mask = mask & (offs_q_pos[:, None] >= offs_n[None, :])
         if WINDOW_SIZE_PAST != -1:
-            # (수정) offs_m_fused가 아닌 offs_q_pos를 사용해야 함
             past_mask = (offs_q_pos[:, None] - offs_n[None, :]) >= WINDOW_SIZE_PAST
             qk = tl.where(past_mask, float("-inf"), qk)
         if WINDOW_SIZE_FUTURE != -1:
-            # (수정) offs_q_pos를 사용해야 함
-            future_mask = (offs_n[None, :] - offs_q_pos[:, None]) > WINDOW_SIZE_FUTURE
+            future_mask = (offs_n[None, :] - offs_q_pos[None, :]) > WINDOW_SIZE_FUTURE
             qk = tl.where(future_mask, float("-inf"), qk)
 
         qk = tl.where(mask, qk, float("-inf"))
 
-        # --- 상태 업데이트 ---
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.exp(qk - m_ij[:, None])
         l_j = tl.sum(p, 1)
-
-        # (수정) m_ij가 -inf일 때 0.0으로 클램핑 (NaN 방지)
         m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
         if tl.sum(p) > 0.0:
@@ -323,23 +327,19 @@ def kernel_attention_contiguous_v3(
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
 
-        # V 로드
         v_ptrs = v_ptrs_base + (offs_n[:, None] * stride_v_seq + offs_d[None, :])
         v_mask = offs_n[:, None] < kv_seq_len
-        v = tl.load(v_ptrs, mask=v_mask & d_mask_q_v, other=0.0)
+        v_load = tl.load(v_ptrs, mask=v_mask & d_mask_q_v, other=0.0)
+        v = v_load
 
-        # Acc 업데이트
         acc += tl.dot(p.to(v.dtype), v)
 
         l_i = l_i * alpha + l_j
         m_i = m_ij
 
         start_n += BLOCK_N
-    # --- K/V 순회 루프 종료 ---
 
-    # --- 결과 저장 ---
     pid_m_block = tl.program_id(2)
-
     all_masked_out_ptr = all_masked_ptr + batch_idx * stride_am_batch + kv_head_idx * stride_am_head + pid_m_block
     tl.store(all_masked_out_ptr, all_masked_flag)
 
@@ -348,6 +348,7 @@ def kernel_attention_contiguous_v3(
     tl.store(lse_ptrs, lse, mask=q_mask)
 
     acc = acc / l_i[:, None]
+
     out_ptrs = output_ptr + (
         batch_idx * stride_out_batch
         + offs_q_pos[:, None] * stride_out_seq
@@ -357,32 +358,45 @@ def kernel_attention_contiguous_v3(
     tl.store(out_ptrs, acc, mask=q_mask[:, None] & d_mask_q_v)
 
 
-def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, window_size: tuple):
+def triton_attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    window_size: tuple,
+    alibi_slopes: torch.Tensor = None,
+    qq_bias: torch.Tensor = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    out_scale: float = 1.0,
+):
+    USE_ALIBI_SLOPES = alibi_slopes is not None
+    USE_QQ_BIAS = qq_bias is not None
+
     batch_size, q_seq_len, num_query_heads, head_size = query.shape
     _, kv_seq_len, num_kv_heads, _ = key.shape
 
     output = torch.empty_like(query)
     lse_output = torch.empty((batch_size, num_query_heads, q_seq_len), dtype=torch.float32, device=query.device)
 
-    # --- 1. 블록 크기 설정 ---
-    # !! 성능 향상을 위해 16 대신 64 또는 128을 강력히 권장합니다 !!
-    BLOCK_Q_PER_HEAD = 16  # (기존의 BLOCK_M)
-    BLOCK_N = 64
+    BLOCK_Q_PER_HEAD_FOR_GRID = 16
 
-    # --- 2. GQA Fused Constexpr 계산 ---
     num_queries_per_kv = num_query_heads // num_kv_heads
-    BLOCK_M_FUSED = BLOCK_Q_PER_HEAD * num_queries_per_kv
 
-    # --- 3. Grid 설정 (v2와 동일) ---
-    # grid의 3번째 차원은 K/V 그룹이 아닌, 쿼리 시퀀스를 얼마나 쪼갤지 정의
-    grid = (batch_size, num_kv_heads, triton.cdiv(q_seq_len, BLOCK_Q_PER_HEAD))
+    grid = (batch_size, num_kv_heads, triton.cdiv(q_seq_len, BLOCK_Q_PER_HEAD_FOR_GRID))
 
     PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
 
-    # all_masked_output의 shape은 grid와 일치
     all_masked_output = torch.empty(grid, dtype=torch.int32, device=query.device)
 
-    kernel_attention_contiguous_v3[grid](
+    if alibi_slopes is None:
+        alibi_slopes = torch.empty(0, dtype=query.dtype, device=query.device)
+    if qq_bias is None:
+        qq_bias = torch.empty(0, dtype=query.dtype, device=query.device)
+
+    kernel_attention_contiguous_vllm_ported[grid](
         output,
         lse_output,
         all_masked_output,
@@ -390,7 +404,8 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
         key,
         value,
         sinks,
-        # Strides
+        alibi_slopes,
+        qq_bias,
         output.stride(0),
         output.stride(1),
         output.stride(2),
@@ -408,17 +423,21 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
         value.stride(0),
         value.stride(1),
         value.stride(2),
-        # Dims (num_query_heads, num_kv_heads 제거)
+        qq_bias.stride(0) if USE_QQ_BIAS else 0,
         q_seq_len,
         kv_seq_len,
         scale,
-        # Constexpr
-        NUM_QUERIES_PER_KV=num_queries_per_kv,  # (새로 추가)
+        k_scale,
+        v_scale,
+        out_scale,
+        NUM_QUERIES_PER_KV=num_queries_per_kv,
         HEAD_SIZE=head_size,
         HEAD_SIZE_PADDED=PADDED_HEAD_SIZE,
         IS_CAUSAL=is_causal,
         WINDOW_SIZE_PAST=window_size[0],
         WINDOW_SIZE_FUTURE=window_size[1],
+        USE_ALIBI_SLOPES=USE_ALIBI_SLOPES,
+        USE_QQ_BIAS=USE_QQ_BIAS,
     )
 
     all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
