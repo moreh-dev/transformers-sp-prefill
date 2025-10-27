@@ -4,9 +4,97 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
+import yunchang.comm.extract_local
 from yunchang.comm.all_to_all import SeqAllToAll4D
+from yunchang.globals import PROCESS_GROUP
 from yunchang.kernels import AttnType
 from yunchang.ring.utils import RingComm, update_out_and_lse
+
+
+def zigzag_extract_local_patched(value, rank, world_size, rd, ud, dim=1, *args, **kwargs):
+    """
+    value is a tensor of shape (bs, seqlen, ...)
+    """
+    input_dim = value.dim()
+    assert input_dim >= 2
+
+    shape = list(value.shape)
+    seqlen = shape[dim]
+
+    value_chunks = value.chunk(2 * rd, dim=dim)
+
+    r_rank = dist.get_rank(group=PROCESS_GROUP.RING_PG)
+    u_rank = dist.get_rank(group=PROCESS_GROUP.ULYSSES_PG)
+
+    assert dist.get_world_size(group=PROCESS_GROUP.RING_PG) == rd
+    assert dist.get_world_size(group=PROCESS_GROUP.ULYSSES_PG) == ud
+
+    local_value = torch.cat([value_chunks[r_rank], value_chunks[2 * rd - r_rank - 1]], dim=dim).chunk(ud, dim=dim)[
+        u_rank
+    ]
+
+    new_shape = shape
+    new_shape[dim] = seqlen // world_size
+    return local_value.reshape(new_shape).contiguous()
+
+
+def all_gather_zigzag(local_tensor, rd, ud, dim=1, *args, **kwargs):
+    """
+    Inverse of zigzag_extract_local_patched (All-Gather with Reordering).
+    """
+
+    ring_pg = PROCESS_GROUP.RING_PG
+    ulysses_pg = PROCESS_GROUP.ULYSSES_PG
+
+    # --- 1. ulysses All-Gather ---
+
+    # (B, H, S_local, D) -> (S_local, H, B, D)
+    local_tensor_trans = local_tensor.transpose(0, dim).contiguous()
+
+    # out shape (S_local*ud, H, B, D)
+    shape_trans = list(local_tensor_trans.shape)
+    shape_trans[0] *= ud
+    concatenated_chunk_trans = torch.empty(shape_trans, dtype=local_tensor.dtype, device=local_tensor.device)
+
+    dist.all_gather_into_tensor(concatenated_chunk_trans, local_tensor_trans, group=ulysses_pg)
+
+    # (S_local*ud, H, B, D) -> (B, H, S_local*ud, D)
+    concatenated_chunk = concatenated_chunk_trans.transpose(0, dim).contiguous()
+
+    # --- 2. Chunk Split ---
+    chunk_O_r, chunk_O_other = concatenated_chunk.chunk(2, dim=dim)
+
+    chunk_O_r = chunk_O_r.contiguous()
+    chunk_O_other = chunk_O_other.contiguous()
+
+    # --- 3. Ring All-Gather ---
+
+    # first half chunks
+    chunk_O_r_trans = chunk_O_r.transpose(0, dim).contiguous()
+    shape_r_trans = list(chunk_O_r_trans.shape)
+    shape_r_trans[0] *= rd
+    gathered_O_r_trans = torch.empty(shape_r_trans, dtype=local_tensor.dtype, device=local_tensor.device)
+    dist.all_gather_into_tensor(gathered_O_r_trans, chunk_O_r_trans, group=ring_pg)
+    gathered_O_r = gathered_O_r_trans.transpose(0, dim).contiguous()
+
+    # second half chunks
+    chunk_O_other_trans = chunk_O_other.transpose(0, dim).contiguous()
+    shape_other_trans = list(chunk_O_other_trans.shape)
+    shape_other_trans[0] *= rd
+    gathered_O_other_trans = torch.empty(shape_other_trans, dtype=local_tensor.dtype, device=local_tensor.device)
+    dist.all_gather_into_tensor(gathered_O_other_trans, chunk_O_other_trans, group=ring_pg)
+    gathered_O_other = gathered_O_other_trans.transpose(0, dim).contiguous()
+
+    # --- 4. Final Assembly ---
+    other_chunks_list = gathered_O_other.chunk(rd, dim=dim)
+    gathered_O_other_reversed = torch.cat(list(reversed(other_chunks_list)), dim=dim)
+
+    global_tensor = torch.cat([gathered_O_r, gathered_O_other_reversed], dim=dim)
+
+    return global_tensor.contiguous()
+
+
+yunchang.comm.extract_local.EXTRACT_FUNC_DICT["zigzag"] = zigzag_extract_local_patched
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -28,7 +116,7 @@ def torch_attention_with_sinks_forward(
     sinks: torch.Tensor,
     scale: float,
     is_causal: bool,
-    window_size: tuple[int, int],
+    window_size: tuple[int, int] = (-1, -1),
 ) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size, seq_len, num_query_heads, head_size = query.shape
     _, _, num_kv_heads, _ = key.shape
@@ -93,23 +181,34 @@ def torch_attention_with_sinks_forward(
     return final_output, final_lse, all_masked
 
 
+configs = []
+for block_q in [8, 16, 32]:
+    for block_n in [32, 64, 128]:
+        for num_warps in [4, 8]:
+            configs.append(triton.Config({"BLOCK_Q_PER_HEAD": block_q, "BLOCK_N": block_n}, num_warps=num_warps))
+
+
+@triton.autotune(
+    configs=configs,
+    key=["q_seq_len", "kv_seq_len", "HEAD_SIZE"],
+)
 @triton.jit
-def kernel_attention_contiguous(
+def kernel_attention_contiguous_vllm_ported(
     output_ptr,
     lse_ptr,
-    all_masked_ptr,  # NEW: Pointer to store the all_masked flag
+    all_masked_ptr,
     query_ptr,
     key_ptr,
     value_ptr,
     sinks_ptr,
-    # Strides for (B, S, H, D) layout
+    alibi_slopes_ptr,  # [num_query_heads]
+    qq_bias_ptr,  # [q_seq_len, q_seq_len]
     stride_out_batch,
     stride_out_seq,
     stride_out_head,
     stride_lse_batch,
     stride_lse_head,
     stride_lse_seq,
-    # NEW: Strides for all_masked output (grid shape)
     stride_am_batch,
     stride_am_head,
     stride_q_batch,
@@ -121,73 +220,98 @@ def kernel_attention_contiguous(
     stride_v_batch,
     stride_v_seq,
     stride_v_head,
-    num_query_heads,
-    num_kv_heads,
-    seq_len,
-    head_size,
+    qq_bias_stride_0,  # int (qq_bias.stride(0))
+    q_seq_len,
+    kv_seq_len,
     scale,
-    BLOCK_M: tl.constexpr,
+    k_scale,  # float32
+    v_scale,  # float32
+    out_scale,  # float32
+    BLOCK_Q_PER_HEAD: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    BLOCK_DMODEL: tl.constexpr,
+    NUM_QUERIES_PER_KV: tl.constexpr,
+    HEAD_SIZE: tl.constexpr,
+    HEAD_SIZE_PADDED: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     WINDOW_SIZE_PAST: tl.constexpr,
     WINDOW_SIZE_FUTURE: tl.constexpr,
+    USE_ALIBI_SLOPES: tl.constexpr,
+    USE_QQ_BIAS: tl.constexpr,
 ):
+    BLOCK_M_FUSED: tl.constexpr = BLOCK_Q_PER_HEAD * NUM_QUERIES_PER_KV
+
     batch_idx = tl.program_id(0)
-    head_idx = tl.program_id(1)
-    start_m = tl.program_id(2) * BLOCK_M
+    kv_head_idx = tl.program_id(1)
 
-    num_queries_per_kv = num_query_heads // num_kv_heads
-    kv_head_idx = head_idx // num_queries_per_kv
-
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    offs_d = tl.arange(0, BLOCK_DMODEL)
-
-    q_ptrs = query_ptr + (
-        batch_idx * stride_q_batch + offs_m[:, None] * stride_q_seq + head_idx * stride_q_head + offs_d[None, :]
-    )
+    start_m_q_pos = tl.program_id(2) * BLOCK_Q_PER_HEAD
+    offs_m_fused = tl.arange(0, BLOCK_M_FUSED)
+    offs_q_pos = start_m_q_pos + (offs_m_fused // NUM_QUERIES_PER_KV)
+    offs_q_head_offset = offs_m_fused % NUM_QUERIES_PER_KV
+    head_idx = kv_head_idx * NUM_QUERIES_PER_KV + offs_q_head_offset
 
     k_ptrs_base = key_ptr + (batch_idx * stride_k_batch + kv_head_idx * stride_k_head)
     v_ptrs_base = value_ptr + (batch_idx * stride_v_batch + kv_head_idx * stride_v_head)
 
-    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
+    d_mask = offs_d < HEAD_SIZE
+    d_mask_q_v = d_mask[None, :]
+    d_mask_k = d_mask[:, None]
+    q_mask = offs_q_pos < q_seq_len
 
-    sink_val = tl.load(sinks_ptr + head_idx).to(tl.float32)
-    m_i = tl.full([BLOCK_M], sink_val, tl.float32)
-    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    q_ptrs = (
+        query_ptr
+        + batch_idx * stride_q_batch
+        + offs_q_pos[:, None] * stride_q_seq
+        + head_idx[:, None] * stride_q_head
+        + offs_d[None, :]
+    )
 
-    # NEW: Initialize all_masked flag to 1 (True).
-    # It will be set to 0 if any valid attention score is found.
+    acc = tl.zeros([BLOCK_M_FUSED, HEAD_SIZE_PADDED], dtype=tl.float32)
+    m_i = tl.load(sinks_ptr + head_idx, mask=q_mask, other=float("-inf")).to(tl.float32)
+    l_i = tl.full([BLOCK_M_FUSED], 1.0, dtype=tl.float32)
     all_masked_flag = 1
 
-    q_mask = offs_m < seq_len
-    q = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+    q = tl.load(q_ptrs, mask=q_mask[:, None] & d_mask_q_v, other=0.0)
     q = (q * scale).to(q.dtype)
 
-    end_n = seq_len
-    if IS_CAUSAL:
-        end_n = start_m + BLOCK_M
+    if USE_ALIBI_SLOPES:
+        alibi_slope = tl.load(alibi_slopes_ptr + head_idx, mask=q_mask, other=0.0)
 
+    if USE_QQ_BIAS:
+        qq_bias_row_ptrs = qq_bias_ptr + offs_q_pos[:, None] * qq_bias_stride_0
+
+    end_n = kv_seq_len
     start_n = 0
     while start_n < end_n:
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
-        k_mask = offs_n[None, :] < seq_len
-        k = tl.load(k_ptrs, mask=k_mask, other=0.0)
+        k_mask = offs_n[None, :] < kv_seq_len
 
-        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        k_ptrs = k_ptrs_base + (offs_d[:, None] * 1 + offs_n[None, :] * stride_k_seq)
+        k_load = tl.load(k_ptrs, mask=k_mask & d_mask_k, other=0.0)
+
+        k = k_load
+
+        qk = tl.zeros([BLOCK_M_FUSED, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k)
 
-        mask = q_mask[:, None] & (offs_n[None, :] < end_n)
+        if USE_ALIBI_SLOPES:
+            alibi_bias = alibi_slope[:, None] * offs_n[None, :]
+            qk += alibi_bias
+
+        if USE_QQ_BIAS:
+            key_pos = offs_n[None, :]
+            qq_bias_mask = (key_pos >= 0) & (key_pos < q_seq_len)
+            qq_bias = tl.load(qq_bias_row_ptrs + key_pos, mask=qq_bias_mask & q_mask[:, None], other=0.0)
+            qk += qq_bias
+
+        mask = q_mask[:, None] & (offs_n[None, :] < kv_seq_len)
         if IS_CAUSAL:
-            mask = mask & (offs_m[:, None] >= offs_n[None, :])
-
+            mask = mask & (offs_q_pos[:, None] >= offs_n[None, :])
         if WINDOW_SIZE_PAST != -1:
-            past_mask = (offs_m[:, None] - offs_n[None, :]) >= WINDOW_SIZE_PAST
+            past_mask = (offs_q_pos[:, None] - offs_n[None, :]) >= WINDOW_SIZE_PAST
             qk = tl.where(past_mask, float("-inf"), qk)
-
         if WINDOW_SIZE_FUTURE != -1:
-            future_mask = (offs_n[None, :] - offs_m[:, None]) > WINDOW_SIZE_FUTURE
+            future_mask = (offs_n[None, :] - offs_q_pos[None, :]) > WINDOW_SIZE_FUTURE
             qk = tl.where(future_mask, float("-inf"), qk)
 
         qk = tl.where(mask, qk, float("-inf"))
@@ -195,10 +319,8 @@ def kernel_attention_contiguous(
         m_ij = tl.maximum(m_i, tl.max(qk, 1))
         p = tl.exp(qk - m_ij[:, None])
         l_j = tl.sum(p, 1)
+        m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
-        # NEW: Check if any attention was computed in this block.
-        # If the sum of probabilities `p` is greater than 0,
-        # it means at least one logit was not -inf.
         if tl.sum(p) > 0.0:
             all_masked_flag = 0
 
@@ -206,8 +328,9 @@ def kernel_attention_contiguous(
         acc = acc * alpha[:, None]
 
         v_ptrs = v_ptrs_base + (offs_n[:, None] * stride_v_seq + offs_d[None, :])
-        v_mask = offs_n[:, None] < seq_len
-        v = tl.load(v_ptrs, mask=v_mask, other=0.0)
+        v_mask = offs_n[:, None] < kv_seq_len
+        v_load = tl.load(v_ptrs, mask=v_mask & d_mask_q_v, other=0.0)
+        v = v_load
 
         acc += tl.dot(p.to(v.dtype), v)
 
@@ -216,41 +339,64 @@ def kernel_attention_contiguous(
 
         start_n += BLOCK_N
 
-    # NEW: Store the all_masked flag for the current program instance.
     pid_m_block = tl.program_id(2)
-    all_masked_out_ptr = all_masked_ptr + batch_idx * stride_am_batch + head_idx * stride_am_head + pid_m_block
+    all_masked_out_ptr = all_masked_ptr + batch_idx * stride_am_batch + kv_head_idx * stride_am_head + pid_m_block
     tl.store(all_masked_out_ptr, all_masked_flag)
 
     lse = m_i + tl.log(l_i)
-    lse_ptrs = lse_ptr + (batch_idx * stride_lse_batch + head_idx * stride_lse_head + offs_m)
+    lse_ptrs = lse_ptr + (batch_idx * stride_lse_batch + head_idx * stride_lse_head + offs_q_pos * stride_lse_seq)
     tl.store(lse_ptrs, lse, mask=q_mask)
 
     acc = acc / l_i[:, None]
+
     out_ptrs = output_ptr + (
-        batch_idx * stride_out_batch + offs_m[:, None] * stride_out_seq + head_idx * stride_out_head + offs_d[None, :]
+        batch_idx * stride_out_batch
+        + offs_q_pos[:, None] * stride_out_seq
+        + head_idx[:, None] * stride_out_head
+        + offs_d[None, :]
     )
-    tl.store(out_ptrs, acc, mask=q_mask[:, None])
+    tl.store(out_ptrs, acc, mask=q_mask[:, None] & d_mask_q_v)
 
 
-# --- MODIFIED Python Wrapper for Triton Kernel ---
-def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, window_size: tuple):
-    # Input shapes: (B, S, H, D)
-    batch_size, seq_len, num_query_heads, head_size = query.shape
-    _, _, num_kv_heads, _ = key.shape
+def triton_attention_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    sinks: torch.Tensor,
+    scale: float,
+    is_causal: bool,
+    window_size: tuple,
+    alibi_slopes: torch.Tensor = None,
+    qq_bias: torch.Tensor = None,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    out_scale: float = 1.0,
+):
+    USE_ALIBI_SLOPES = alibi_slopes is not None
+    USE_QQ_BIAS = qq_bias is not None
+
+    batch_size, q_seq_len, num_query_heads, head_size = query.shape
+    _, kv_seq_len, num_kv_heads, _ = key.shape
 
     output = torch.empty_like(query)
-    # LSE shape: (B, H, S)
-    lse_output = torch.empty((batch_size, num_query_heads, seq_len), dtype=torch.float32, device=query.device)
+    lse_output = torch.empty((batch_size, num_query_heads, q_seq_len), dtype=torch.float32, device=query.device)
 
-    BLOCK_M = 16
-    BLOCK_N = 64
+    BLOCK_Q_PER_HEAD_FOR_GRID = 16
 
-    grid = (batch_size, num_query_heads, triton.cdiv(seq_len, BLOCK_M))
+    num_queries_per_kv = num_query_heads // num_kv_heads
 
-    # Create a tensor to store the all_masked flag for each program in the grid.
+    grid = (batch_size, num_kv_heads, triton.cdiv(q_seq_len, BLOCK_Q_PER_HEAD_FOR_GRID))
+
+    PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
+
     all_masked_output = torch.empty(grid, dtype=torch.int32, device=query.device)
 
-    kernel_attention_contiguous[grid](
+    if alibi_slopes is None:
+        alibi_slopes = torch.empty(0, dtype=query.dtype, device=query.device)
+    if qq_bias is None:
+        qq_bias = torch.empty(0, dtype=query.dtype, device=query.device)
+
+    kernel_attention_contiguous_vllm_ported[grid](
         output,
         lse_output,
         all_masked_output,
@@ -258,47 +404,44 @@ def triton_attention_forward(query, key, value, sinks, scale, is_causal: bool, w
         key,
         value,
         sinks,
-        # Strides for Output (B, S, H, D)
+        alibi_slopes,
+        qq_bias,
         output.stride(0),
         output.stride(1),
         output.stride(2),
-        # Strides for LSE (B, H, S)
         lse_output.stride(0),
         lse_output.stride(1),
         lse_output.stride(2),
-        # Strides for all_masked (matches grid shape)
         all_masked_output.stride(0),
         all_masked_output.stride(1),
-        # Strides for Q (B, S, H, D)
         query.stride(0),
         query.stride(1),
         query.stride(2),
-        # Strides for K (B, S, H_kv, D)
         key.stride(0),
         key.stride(1),
         key.stride(2),
-        # Strides for V (B, S, H_kv, D)
         value.stride(0),
         value.stride(1),
         value.stride(2),
-        num_query_heads,
-        num_kv_heads,
-        seq_len,
-        head_size,
+        qq_bias.stride(0) if USE_QQ_BIAS else 0,
+        q_seq_len,
+        kv_seq_len,
         scale,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=head_size,
+        k_scale,
+        v_scale,
+        out_scale,
+        NUM_QUERIES_PER_KV=num_queries_per_kv,
+        HEAD_SIZE=head_size,
+        HEAD_SIZE_PADDED=PADDED_HEAD_SIZE,
         IS_CAUSAL=is_causal,
         WINDOW_SIZE_PAST=window_size[0],
         WINDOW_SIZE_FUTURE=window_size[1],
+        USE_ALIBI_SLOPES=USE_ALIBI_SLOPES,
+        USE_QQ_BIAS=USE_QQ_BIAS,
     )
 
-    # MODIFIED: Return the all_masked_output tensor as a boolean tensor.
-    # The int32 tensor (1 for masked, 0 for not) is converted to bool (True for masked, False for not).
-    all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
-
-    return output, lse_output, all_masked_scalar
+    # all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
+    return output, lse_output, None
 
 
 def moreh_gpt_attention(
@@ -333,6 +476,7 @@ def moreh_gpt_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
     comm = RingComm(module.ring_pg)
+    assert comm.world_size <= 16, "Ring Attention only supports up to 16 devices."
 
     out = None
     lse = None
@@ -344,9 +488,11 @@ def moreh_gpt_attention(
     chunk_len = query_layer.shape[1]
 
     for step in range(comm.world_size):
-        attn_done_local = torch.zeros(1, device=query.device, dtype=torch.int32)
-
-        if step + 1 != comm.world_size:
+        current_is_early_stop = window_size[0] != -1 and step == 2
+        next_is_early_stop = window_size[0] != -1 and step == 1
+        if current_is_early_stop:
+            break
+        if step + 1 != comm.world_size and not next_is_early_stop:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
             comm.commit()
@@ -372,15 +518,123 @@ def moreh_gpt_attention(
                 window_size=adjusted_window_size,
             )
 
-            if not all_masked:
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
+        if step + 1 != comm.world_size and not next_is_early_stop:
+            comm.wait()
+            key_layer = next_k
+            value_layer = next_v
+
+    out = out.to(query.dtype)
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    else:
+        output = out
+
+    return output
+
+
+def moreh_gpt_attention_balanced(
+    module,
+    query,
+    key,
+    value,
+    sinks,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    is_kernel_bhsd: bool = True,
+) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert module.attn_type == AttnType.TORCH
+    assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
+
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
+    comm = RingComm(module.ring_pg)
+
+    assert causal, "Balanced Ring Attention requires causal=True"
+    block_seq_len = query_layer.shape[1] // 2
+    query1 = query_layer[:, block_seq_len:]
+
+    out = None
+    lse = None
+
+    next_k, next_v = None, None
+
+    if comm.rank == 3:
+        breakpoint()
+    else:
+        while True:
+            pass
+    for step in range(comm.world_size):
+        if step + 1 != comm.world_size:
+            next_k: torch.Tensor = comm.send_recv(key_layer)
+            next_v: torch.Tensor = comm.send_recv(value_layer)
+            comm.commit()
+
+        key, value = key_layer, value_layer
+
+        if step == 0:
+            block_out, block_lse, _ = triton_attention_forward(
+                query_layer,
+                key,
+                value,
+                sinks,
+                scale=softmax_scale,
+                is_causal=causal,
+                window_size=window_size,
+            )
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
+        elif step <= comm.rank:
+            key0 = key[:, :block_seq_len]
+            value0 = value[:, :block_seq_len]
+
+            if key0.shape[1] > 0:
+                block_out, block_lse, _ = triton_attention_forward(
+                    query_layer,
+                    key0,
+                    value0,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=False,
+                    window_size=window_size,
+                )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
-                attn_done_local[0] = True
 
-        dist.all_reduce(attn_done_local, op=dist.ReduceOp.SUM)
-
-        if attn_done_local.item() == 0:
-            print(f"rank {comm.rank} early terminating at step {step}")
-            break
+        else:
+            block_out, block_lse, _ = triton_attention_forward(
+                query1,
+                key,
+                value,
+                sinks,
+                scale=softmax_scale,
+                is_causal=False,
+                window_size=window_size,
+            )
+            out, lse = update_out_and_lse(
+                out,
+                lse,
+                block_out,
+                block_lse,
+                slice_=(slice(None), slice(block_seq_len, None)),
+            )
 
         if step + 1 != comm.world_size:
             comm.wait()

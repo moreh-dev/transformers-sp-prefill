@@ -320,7 +320,7 @@ class GptOssAttention(nn.Module):
         causal = True
 
         if self.sliding_window is not None:
-            window_size = (self.sliding_window,) * 2
+            window_size = (self.sliding_window, -1)
         else:
             window_size = (-1, -1)
 
