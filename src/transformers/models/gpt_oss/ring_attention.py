@@ -440,8 +440,8 @@ def triton_attention_forward(
         USE_QQ_BIAS=USE_QQ_BIAS,
     )
 
-    all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
-    return output, lse_output, all_masked_scalar
+    # all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
+    return output, lse_output, None
 
 
 def moreh_gpt_attention(
