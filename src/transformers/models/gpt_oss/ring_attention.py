@@ -11,6 +11,18 @@ from yunchang.kernels import AttnType
 from yunchang.ring.utils import RingComm, update_out_and_lse
 
 
+_RING_COMM_STREAM = None
+
+
+def _get_ring_comm_stream():
+    global _RING_COMM_STREAM
+
+    if _RING_COMM_STREAM is None:
+        _RING_COMM_STREAM = torch.cuda.Stream()
+
+    return _RING_COMM_STREAM
+
+
 def zigzag_extract_local_patched(value, rank, world_size, rd, ud, dim=1, *args, **kwargs):
     """
     value is a tensor of shape (bs, seqlen, ...)
@@ -442,8 +454,7 @@ def triton_attention_forward(
         USE_QQ_BIAS=USE_QQ_BIAS,
     )
 
-    # all_masked_scalar = torch.all(all_masked_output.to(torch.bool)).item()
-    return output, lse_output, None
+    return output, lse_output
 
 
 def moreh_gpt_attention(
@@ -492,6 +503,7 @@ def moreh_gpt_attention(
     original_window_size = window_size
 
     chunk_len = query_layer.shape[1]
+    comm_stream = _get_ring_comm_stream()
 
     for step in range(comm.world_size):
         current_is_early_stop = window_size[0] != -1 and step == 2
@@ -501,7 +513,8 @@ def moreh_gpt_attention(
         if step + 1 != comm.world_size and not next_is_early_stop:
             next_k: torch.Tensor = comm.send_recv(key_layer)
             next_v: torch.Tensor = comm.send_recv(value_layer)
-            comm.commit()
+            with torch.cuda.stream(comm_stream):
+                comm.commit()
 
         key, value = key_layer, value_layer
 
@@ -514,7 +527,7 @@ def moreh_gpt_attention(
         adjusted_window_size = (adjusted_left, adjusted_right)
 
         if not causal or step <= comm.rank:
-            block_out, block_lse, all_masked = triton_attention_forward(
+            block_out, block_lse = triton_attention_forward(
                 query_layer,
                 key,
                 value,
@@ -597,7 +610,7 @@ def moreh_gpt_attention_balanced(
         key, value = key_layer, value_layer
 
         if step == 0:
-            block_out, block_lse, _ = triton_attention_forward(
+            block_out, block_lse = triton_attention_forward(
                 query_layer,
                 key,
                 value,
@@ -613,7 +626,7 @@ def moreh_gpt_attention_balanced(
             value0 = value[:, :block_seq_len]
 
             if key0.shape[1] > 0:
-                block_out, block_lse, _ = triton_attention_forward(
+                block_out, block_lse = triton_attention_forward(
                     query_layer,
                     key0,
                     value0,
@@ -625,7 +638,7 @@ def moreh_gpt_attention_balanced(
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         else:
-            block_out, block_lse, _ = triton_attention_forward(
+            block_out, block_lse = triton_attention_forward(
                 query1,
                 key,
                 value,
