@@ -385,11 +385,15 @@ def triton_attention_forward(
     output = torch.empty_like(query)
     lse_output = torch.empty((batch_size, num_query_heads, q_seq_len), dtype=torch.float32, device=query.device)
 
-    BLOCK_Q_PER_HEAD_FOR_GRID = 16
-
     num_queries_per_kv = num_query_heads // num_kv_heads
 
-    grid = (batch_size, num_kv_heads, triton.cdiv(q_seq_len, BLOCK_Q_PER_HEAD_FOR_GRID))
+    def grid(meta):
+        return (
+            batch_size,
+            num_kv_heads,
+            triton.cdiv(q_seq_len, meta["BLOCK_Q_PER_HEAD"]),
+        )
+
 
     PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
 
@@ -581,11 +585,6 @@ def moreh_gpt_attention_balanced(
 
     next_k, next_v = None, None
 
-    if comm.rank == 3:
-        breakpoint()
-    else:
-        while True:
-            pass
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
