@@ -208,7 +208,6 @@ for block_q in [8, 16, 32]:
 def kernel_attention_contiguous_vllm_ported(
     output_ptr,
     lse_ptr,
-    all_masked_ptr,
     query_ptr,
     key_ptr,
     value_ptr,
@@ -221,8 +220,6 @@ def kernel_attention_contiguous_vllm_ported(
     stride_lse_batch,
     stride_lse_head,
     stride_lse_seq,
-    stride_am_batch,
-    stride_am_head,
     stride_q_batch,
     stride_q_seq,
     stride_q_head,
@@ -281,7 +278,6 @@ def kernel_attention_contiguous_vllm_ported(
     acc = tl.zeros([BLOCK_M_FUSED, HEAD_SIZE_PADDED], dtype=tl.float32)
     m_i = tl.load(sinks_ptr + head_idx, mask=q_mask, other=float("-inf")).to(tl.float32)
     l_i = tl.full([BLOCK_M_FUSED], 1.0, dtype=tl.float32)
-    all_masked_flag = 1
 
     q = tl.load(q_ptrs, mask=q_mask[:, None] & d_mask_q_v, other=0.0)
     q = (q * scale).to(q.dtype)
@@ -333,8 +329,6 @@ def kernel_attention_contiguous_vllm_ported(
         l_j = tl.sum(p, 1)
         m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
-        if tl.sum(p) > 0.0:
-            all_masked_flag = 0
 
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
@@ -350,10 +344,6 @@ def kernel_attention_contiguous_vllm_ported(
         m_i = m_ij
 
         start_n += BLOCK_N
-
-    pid_m_block = tl.program_id(2)
-    all_masked_out_ptr = all_masked_ptr + batch_idx * stride_am_batch + kv_head_idx * stride_am_head + pid_m_block
-    tl.store(all_masked_out_ptr, all_masked_flag)
 
     lse = m_i + tl.log(l_i)
     lse_ptrs = lse_ptr + (batch_idx * stride_lse_batch + head_idx * stride_lse_head + offs_q_pos * stride_lse_seq)
@@ -403,8 +393,6 @@ def triton_attention_forward(
 
     PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
 
-    all_masked_output = torch.empty(grid, dtype=torch.int32, device=query.device)
-
     if alibi_slopes is None:
         alibi_slopes = torch.empty(0, dtype=query.dtype, device=query.device)
     if qq_bias is None:
@@ -413,7 +401,6 @@ def triton_attention_forward(
     kernel_attention_contiguous_vllm_ported[grid](
         output,
         lse_output,
-        all_masked_output,
         query,
         key,
         value,
@@ -426,8 +413,6 @@ def triton_attention_forward(
         lse_output.stride(0),
         lse_output.stride(1),
         lse_output.stride(2),
-        all_masked_output.stride(0),
-        all_masked_output.stride(1),
         query.stride(0),
         query.stride(1),
         query.stride(2),
