@@ -42,7 +42,7 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
-from .ring_attention import moreh_gpt_attention
+from .ring_attention import moreh_gpt_attention, moreh_gpt_attention_balanced
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -325,7 +325,8 @@ class GptOssAttention(nn.Module):
             window_size = (-1, -1)
 
         attn_class = xFuserLongContextAttention(attn_type=AttnType.TORCH)
-        attn_output = moreh_gpt_attention(
+        attn_fn = moreh_gpt_attention_balanced if window_size == (-1, -1) else moreh_gpt_attention
+        attn_output = attn_fn(
             attn_class,
             query_states,
             key_states,

@@ -12,6 +12,7 @@ from yunchang.ring.utils import RingComm, update_out_and_lse
 
 
 _RING_COMM_STREAM = None
+_WARMUPED = False
 
 
 def _get_ring_comm_stream():
@@ -202,7 +203,7 @@ for block_q in [8, 16, 32]:
 
 @triton.autotune(
     configs=configs,
-    key=["q_seq_len", "kv_seq_len", "HEAD_SIZE"],
+    key=["q_seq_len", "kv_seq_len", "IS_CAUSAL", "WINDOW_SIZE_PAST"],
 )
 @triton.jit
 def kernel_attention_contiguous_vllm_ported(
@@ -374,6 +375,21 @@ def triton_attention_forward(
     v_scale: float = 1.0,
     out_scale: float = 1.0,
 ):
+    """b, s, nh, hd = query.shape
+    out = torch.empty_like(query)
+    lse = torch.empty((b, nh, s), dtype=torch.float32, device=query.device)
+    return out, lse"""
+
+    """out, lse, _ = flash_attn_func(
+        query,
+        key,
+        value,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=window_size,
+        return_attn_probs=True)
+    return out, lse"""
+
     USE_ALIBI_SLOPES = alibi_slopes is not None
     USE_QQ_BIAS = qq_bias is not None
 
@@ -468,6 +484,20 @@ def moreh_gpt_attention(
 
     ulysses_size = dist.get_world_size(module.ulysses_pg)
 
+    comm = RingComm(module.ring_pg)
+
+    global _WARMUPED
+
+    if not _WARMUPED:
+        tensor = torch.empty_like(key)
+        received_tensor: torch.Tensor = comm.send_recv(tensor)
+        comm_stream = _get_ring_comm_stream()
+        with torch.cuda.stream(comm_stream):
+            comm.commit()
+        comm.wait()
+        received_tensor += 1.
+        _WARMUPED = True
+
     if ulysses_size > 1:
         query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
         key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
@@ -558,15 +588,34 @@ def moreh_gpt_attention_balanced(
     assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
     assert module.attn_type == AttnType.TORCH
     assert window_size == (-1, -1), "Balanced Ring Attention currently only supports full attention (no windowing)."
+    assert causal is True, "Balanced Ring Attention requires causal=True."
 
     query = query.transpose(1, 2).contiguous()
     key = key.transpose(1, 2).contiguous()
     value = value.transpose(1, 2).contiguous()
 
-    if dist.get_world_size(module.ulysses_pg) > 1:
+    ulysses_size = dist.get_world_size(module.ulysses_pg)
+
+    comm = RingComm(module.ring_pg)
+
+    global _WARMUPED
+
+    if not _WARMUPED:
+        tensor = torch.empty_like(key)
+        received_tensor: torch.Tensor = comm.send_recv(tensor)
+        comm_stream = _get_ring_comm_stream()
+        with torch.cuda.stream(comm_stream):
+            comm.commit()
+        comm.wait()
+        received_tensor += 1.
+        _WARMUPED = True
+
+    if ulysses_size > 1:
         query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
         key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
         value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+        ulysses_rank = dist.get_rank(module.ulysses_pg)
+        sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
     else:
         query_layer = query
         key_layer = key
@@ -574,7 +623,6 @@ def moreh_gpt_attention_balanced(
 
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
-    comm = RingComm(module.ring_pg)
 
     assert causal, "Balanced Ring Attention requires causal=True"
     block_seq_len = query_layer.shape[1] // 2
