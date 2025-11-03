@@ -5,6 +5,12 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 import yunchang.comm.extract_local
+from xfuser.core.distributed import (
+    get_ring_parallel_rank,
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
+)
 from yunchang.comm.all_to_all import SeqAllToAll4D
 from yunchang.globals import PROCESS_GROUP
 from yunchang.kernels import AttnType
@@ -24,10 +30,14 @@ def _get_ring_comm_stream():
     return _RING_COMM_STREAM
 
 
-def zigzag_extract_local_patched(value, rank, world_size, rd, ud, dim=1, *args, **kwargs):
+def zigzag_extract_local_patched(value, rank, world_size, rd=None, ud=None, dim=1, *args, **kwargs):
     """
     value is a tensor of shape (bs, seqlen, ...)
     """
+
+    rd = get_ring_parallel_world_size() if rd is None else rd
+    ud = get_ulysses_parallel_world_size() if ud is None else ud
+
     input_dim = value.dim()
     assert input_dim >= 2
 
@@ -36,11 +46,15 @@ def zigzag_extract_local_patched(value, rank, world_size, rd, ud, dim=1, *args, 
 
     value_chunks = value.chunk(2 * rd, dim=dim)
 
-    r_rank = dist.get_rank(group=PROCESS_GROUP.RING_PG)
-    u_rank = dist.get_rank(group=PROCESS_GROUP.ULYSSES_PG)
+    r_rank = get_ring_parallel_rank()
+    u_rank = get_ulysses_parallel_rank()
 
-    assert dist.get_world_size(group=PROCESS_GROUP.RING_PG) == rd
-    assert dist.get_world_size(group=PROCESS_GROUP.ULYSSES_PG) == ud
+    assert get_ring_parallel_world_size() == rd, (
+        f"Ring parallel world size mismatch {get_ring_parallel_world_size()} != {rd}"
+    )
+    assert get_ulysses_parallel_world_size() == ud, (
+        f"Ulysses parallel world size mismatch {get_ulysses_parallel_world_size()} != {ud}"
+    )
 
     local_value = torch.cat([value_chunks[r_rank], value_chunks[2 * rd - r_rank - 1]], dim=dim).chunk(ud, dim=dim)[
         u_rank
@@ -51,10 +65,13 @@ def zigzag_extract_local_patched(value, rank, world_size, rd, ud, dim=1, *args, 
     return local_value.reshape(new_shape).contiguous()
 
 
-def all_gather_zigzag(local_tensor, rd, ud, dim=1, *args, **kwargs):
+def all_gather_zigzag(local_tensor, rd=None, ud=None, dim=1, *args, **kwargs):
     """
     Inverse of zigzag_extract_local_patched (All-Gather with Reordering).
     """
+
+    rd = get_ring_parallel_world_size() if rd is None else rd
+    ud = get_ulysses_parallel_world_size() if ud is None else ud
 
     ring_pg = PROCESS_GROUP.RING_PG
     ulysses_pg = PROCESS_GROUP.ULYSSES_PG
@@ -330,7 +347,6 @@ def kernel_attention_contiguous_vllm_ported(
         l_j = tl.sum(p, 1)
         m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
-
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
 
@@ -409,7 +425,6 @@ def triton_attention_forward(
             num_kv_heads,
             triton.cdiv(q_seq_len, meta["BLOCK_Q_PER_HEAD"]),
         )
-
 
     PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
 
@@ -495,7 +510,7 @@ def moreh_gpt_attention(
         with torch.cuda.stream(comm_stream):
             comm.commit()
         comm.wait()
-        received_tensor += 1.
+        received_tensor += 1.0
         _WARMUPED = True
 
     if ulysses_size > 1:
@@ -607,7 +622,7 @@ def moreh_gpt_attention_balanced(
         with torch.cuda.stream(comm_stream):
             comm.commit()
         comm.wait()
-        received_tensor += 1.
+        received_tensor += 1.0
         _WARMUPED = True
 
     if ulysses_size > 1:

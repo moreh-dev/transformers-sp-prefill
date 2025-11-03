@@ -17,7 +17,7 @@ def setup_distributed():
         return
 
     dist.init_process_group(backend="nccl")
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]) % 8)
 
     world_size = dist.get_world_size()
     ring_size = world_size
@@ -38,7 +38,7 @@ def main():
 
     setup_distributed()
     rank = dist.get_rank()
-    device = f"cuda:{rank}"
+    device = f"cuda:{rank % 8}"
     world_size = dist.get_world_size()
 
     if rank == 0:
@@ -138,6 +138,7 @@ def main():
         print(f"World Size:    {world_size} GPUs")
         print(f"Total Time:    {elapsed_time:.4f} seconds")
         print(f"Throughput:    {tokens_per_second:.2f} tokens/sec")
+        print(f"output_ids: {_}", flush=True)
 
 
 if __name__ == "__main__":

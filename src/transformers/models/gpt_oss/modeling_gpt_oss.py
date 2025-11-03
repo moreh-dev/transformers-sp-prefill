@@ -21,11 +21,16 @@
 from typing import Optional, Union
 
 import torch
+import yunchang.comm.extract_local
 from torch import nn
 from torch.nn import functional as F
 from xfuser.core.distributed import (
+    get_ring_parallel_rank,
+    get_ring_parallel_world_size,
     get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
     get_sp_group,
+    get_ulysses_parallel_world_size,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 from yunchang.kernels import AttnType
@@ -42,7 +47,25 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
-from .ring_attention import moreh_gpt_attention, moreh_gpt_attention_balanced
+from .ring_attention import all_gather_zigzag, moreh_gpt_attention, moreh_gpt_attention_balanced
+
+
+def save_tensor(tensor, name, directory="wo_b"):
+    gathered = None
+    if directory == "wo_b":
+        gathered = get_sp_group().all_gather(tensor, dim=1)
+
+    elif directory == "w_b":
+        gathered = all_gather_zigzag(tensor, dim=1)
+    else:
+        assert False, "directory should be either 'wo_b' or 'w_b'"
+    if not get_ring_parallel_rank() == 0:
+        return
+    import os
+
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    torch.save(gathered, os.path.join(directory, name + ".pt"))
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -189,7 +212,7 @@ class GptOssRotaryEmbedding(nn.Module):
     def forward(self, x, position_ids):
         sp_rank = get_sequence_parallel_rank()
         local_seq_len = int(position_ids.shape[-1])
-        position_ids += sp_rank * local_seq_len
+        # position_ids += sp_rank * local_seq_len
 
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -303,6 +326,25 @@ class GptOssAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.sliding_window is not None:
+            assert self.layer_idx % 2 == 0, "Sliding window attention can only be used in even layers."
+        else:
+            assert self.layer_idx % 2 == 1, "Full attention can only be used in odd layers."
+            hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+            hidden_states = (
+                yunchang.comm.extract_local.EXTRACT_FUNC_DICT["zigzag"](
+                    hidden_states,
+                    -1,  # rank, but not used
+                    world_size=get_sequence_parallel_world_size(),
+                    rd=get_ring_parallel_world_size(),
+                    ud=get_ulysses_parallel_world_size(),
+                    dim=1,
+                )
+                .detach()
+                .clone()
+            )
+
+        # save_tensor(hidden_states, 'attn_input_layer_'+str(self.layer_idx))
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -326,6 +368,7 @@ class GptOssAttention(nn.Module):
 
         attn_class = xFuserLongContextAttention(attn_type=AttnType.TORCH)
         attn_fn = moreh_gpt_attention_balanced if window_size == (-1, -1) else moreh_gpt_attention
+        # attn_fn = moreh_gpt_attention
         attn_output = attn_fn(
             attn_class,
             query_states,
@@ -336,6 +379,24 @@ class GptOssAttention(nn.Module):
             causal=causal,
             window_size=window_size,
         )
+        if self.sliding_window is not None:
+            assert self.layer_idx % 2 == 0, "Sliding window attention can only be used in even layers."
+        else:
+            assert self.layer_idx % 2 == 1, "Full attention can only be used in odd layers."
+            attn_output = all_gather_zigzag(attn_output, dim=1)
+            attn_output = (
+                yunchang.comm.extract_local.EXTRACT_FUNC_DICT["basic"](
+                    attn_output,
+                    -1,  # rank, but not used
+                    world_size=get_sequence_parallel_world_size(),
+                    rd=get_ring_parallel_world_size(),
+                    ud=get_ulysses_parallel_world_size(),
+                    dim=1,
+                )
+                .detach()
+                .clone()
+            )
+        # save_tensor(attn_output, 'attn_output_layer_'+str(self.layer_idx))
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
@@ -381,7 +442,9 @@ class GptOssDecoderLayer(GradientCheckpointingLayer):
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        # save_tensor(hidden_states, 'mlp_input_layer_input_layer_'+str(self.self_attn.layer_idx))
         hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
+        # save_tensor(hidden_states, 'mlp_output_layer_input_layer_'+str(self.self_attn.layer_idx))
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -499,6 +562,41 @@ class GptOssModel(GptOssPreTrainedModel):
             }
 
         hidden_states = inputs_embeds
+
+        """b, s, h = hidden_states.size()
+        
+        hidden_states = (
+            yunchang.comm.extract_local.EXTRACT_FUNC_DICT["zigzag"](
+                hidden_states,
+                -1, # rank, but not used 
+                world_size=get_sequence_parallel_world_size(),
+                rd=get_ring_parallel_world_size(),
+                ud=get_ulysses_parallel_world_size(),
+                dim=1,
+            )
+            .detach()
+            .clone()
+        )
+        
+        
+        assert position_ids.shape == (b, s)
+        position_ids = position_ids.view(b, s, 1)
+        
+        position_ids = (
+            yunchang.comm.extract_local.EXTRACT_FUNC_DICT["zigzag"](
+                position_ids,
+                -1, # rank, but not used 
+                world_size=get_sequence_parallel_world_size(),
+                rd=get_ring_parallel_world_size(),
+                ud=get_ulysses_parallel_world_size(),
+                dim=1,
+            )
+            .detach()
+            .clone()
+        )
+
+        position_ids = position_ids.squeeze(-1)"""
+
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for decoder_layer in self.layers:
@@ -514,6 +612,7 @@ class GptOssModel(GptOssPreTrainedModel):
             )
         hidden_states = self.norm(hidden_states)
         hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
+        # hidden_states = all_gather_zigzag(hidden_states)
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
