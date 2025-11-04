@@ -4,6 +4,7 @@ import unittest
 import torch
 import torch.distributed as dist
 import yunchang.comm.extract_local
+from parameterized import parameterized
 from xfuser.core.distributed import (
     get_sequence_parallel_rank,
     get_sequence_parallel_world_size,
@@ -49,7 +50,13 @@ class RingAttentionTest(unittest.TestCase):
     def tearDownClass(cls):
         dist.destroy_process_group()
 
-    def test_ring_attention_vs_sdpa(self):
+    @parameterized.expand(
+        [
+            ("full_attention", (-1, -1)),
+            ("windowed_attention", (128, -1)),
+        ]
+    )
+    def test_ring_attention_vs_sdpa(self, name, window_size):
         rank = int(os.environ["LOCAL_RANK"])
         device = torch.device(rank)
         batch_size = 1
@@ -120,8 +127,6 @@ class RingAttentionTest(unittest.TestCase):
         sinks = torch.full((num_heads,), float("-inf"), device=device, dtype=dtype)
         sinks = torch.randn_like(sinks)
 
-        window_size = (128, -1)
-
         vanila_output = torch_attention_with_sinks_forward(
             q_total_trans,
             k_total_trans,
@@ -154,16 +159,14 @@ class RingAttentionTest(unittest.TestCase):
             atol = 1e-2
             rtol = 1e-2
 
-            # Perform the allclose check
             is_close = torch.allclose(actual_output, expected_output, atol=atol, rtol=rtol)
 
-            if False:
-                print("\n✅ Test Passed: xFuser Ring Attention is allclose to PyTorch SDPA.")
+            print(f"\n--- Running test case: {name} (window_size={window_size}) ---")
+            if is_close:
+                print(f"✅ Test Passed: xFuser Ring Attention ({name}) is allclose to PyTorch SDPA.")
             else:
-                # If the test fails, print detailed statistics
-                print("\n❌ Test Failed: Outputs are not allclose. Analyzing differences...")
+                print(f"❌ Test Failed: Outputs are not allclose ({name}). Analyzing differences...")
 
-                # Calculate difference statistics
                 diff = actual_output - expected_output
                 abs_diff = torch.abs(diff)
 
@@ -171,24 +174,22 @@ class RingAttentionTest(unittest.TestCase):
                 mean_abs_diff = abs_diff.mean().item()
                 median_abs_diff = abs_diff.median().item()
 
-                print("  - Absolute Difference Stats:")
-                print(f"    - Max:    {max_abs_diff:.6f}")
-                print(f"    - Mean:   {mean_abs_diff:.6f}")
-                print(f"    - Median: {median_abs_diff:.6f}")
+                print("   - Absolute Difference Stats:")
+                print(f"     - Max:    {max_abs_diff:.6f}")
+                print(f"     - Mean:   {mean_abs_diff:.6f}")
+                print(f"     - Median: {median_abs_diff:.6f}")
 
-                # Calculate the rate of differing elements based on atol/rtol
                 mismatched_elements = torch.sum(torch.abs(diff) > (atol + rtol * torch.abs(expected_output)))
                 total_elements = expected_output.numel()
                 mismatch_rate = (mismatched_elements.item() / total_elements) * 100 if total_elements > 0 else 0
 
-                print(f"\n  - Mismatch Rate (atol={atol}, rtol={rtol}):")
-                print(f"    - Mismatched Elements: {mismatched_elements.item()} / {total_elements}")
-                print(f"    - Percentage: {mismatch_rate:.4f}%\n")
+                print(f"\n   - Mismatch Rate (atol={atol}, rtol={rtol}):")
+                print(f"     - Mismatched Elements: {mismatched_elements.item()} / {total_elements}")
+                print(f"     - Percentage: {mismatch_rate:.4f}%\n")
 
-            # The assertion still ensures the test fails correctly
             self.assertTrue(
                 is_close,
-                "The outputs of xFuser Ring Attention and PyTorch SDPA do not match. [See] detailed analysis above.",
+                f"The outputs of xFuser Ring Attention and PyTorch SDPA do not match for {name} (window_size={window_size}). [See] detailed analysis above.",
             )
 
 

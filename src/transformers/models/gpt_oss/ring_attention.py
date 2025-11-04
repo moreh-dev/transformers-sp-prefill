@@ -691,12 +691,12 @@ def _moreh_gpt_attention_balanced_window(
     original_window_size = window_size
     chunk_len_zigzag = query_layer.shape[1] // 2
 
-    for step in range(comm.world_size):
+    for step in range(comm0.world_size):
         current_is_early_stop = step == 2
         next_is_early_stop = step == 1
         if current_is_early_stop:
             break
-        if step + 1 != comm.world_size and not next_is_early_stop:
+        if step + 1 != comm0.world_size and not next_is_early_stop:
             next_k0: torch.Tensor = comm0.send_recv(key_layer0)
             next_k1: torch.Tensor = comm1.send_recv(key_layer1)
             next_v0: torch.Tensor = comm0.send_recv(value_layer0)
@@ -798,7 +798,7 @@ def _moreh_gpt_attention_balanced_window(
         else:
             assert False, "Step should not be greater than 1 in balanced windowed attention."
 
-        if step + 1 != comm.world_size and not next_is_early_stop:
+        if step + 1 != comm0.world_size and not next_is_early_stop:
             comm0.wait()
             comm1.wait()
             key_layer0 = next_k0
