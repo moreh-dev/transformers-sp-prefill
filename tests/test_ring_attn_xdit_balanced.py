@@ -120,6 +120,8 @@ class RingAttentionTest(unittest.TestCase):
         sinks = torch.full((num_heads,), float("-inf"), device=device, dtype=dtype)
         sinks = torch.randn_like(sinks)
 
+        window_size = (128, -1)
+
         vanila_output = torch_attention_with_sinks_forward(
             q_total_trans,
             k_total_trans,
@@ -139,6 +141,7 @@ class RingAttentionTest(unittest.TestCase):
             v_reordered,
             sinks,
             dropout_p=0.0,
+            window_size=window_size,
             causal=causal,
         )
 

@@ -572,7 +572,173 @@ def moreh_gpt_attention(
     return output
 
 
-def moreh_gpt_attention_balanced(
+def _moreh_gpt_attention_balanced_window(
+    module,
+    query,
+    key,
+    value,
+    sinks,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    is_kernel_bhsd: bool = True,
+) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert module.attn_type == AttnType.TORCH
+    assert window_size[1] == -1, "Only left-side window size is supported in balanced ring attention."
+    assert causal is True, "Balanced Ring Attention requires causal=True."
+
+    query = query.transpose(1, 2).contiguous()
+    key = key.transpose(1, 2).contiguous()
+    value = value.transpose(1, 2).contiguous()
+
+    ulysses_size = dist.get_world_size(module.ulysses_pg)
+
+    comm0 = RingComm(module.ring_pg)
+    comm1 = RingComm(module.ring_pg)
+    comm1.send_rank, comm1.recv_rank = comm1.recv_rank, comm1.send_rank
+
+    print (f'comm0 rank {comm0.rank} send_rank {comm0.send_rank} recv_rank {comm0.recv_rank}')
+    print (f'comm1 rank {comm1.rank} send_rank {comm1.send_rank} recv_rank {comm1.recv_rank}')
+
+    global _WARMUPED
+
+    if not _WARMUPED:
+        for comm in [comm0, comm1]:
+            tensor = torch.empty_like(key)
+            received_tensor: torch.Tensor = comm.send_recv(tensor)
+            comm_stream = _get_ring_comm_stream()
+            with torch.cuda.stream(comm_stream):
+                comm.commit()
+            comm.wait()
+            received_tensor += 1.
+        _WARMUPED = True
+
+    if ulysses_size > 1:
+        query_layer = SeqAllToAll4D.apply(module.ulysses_pg, query, module.scatter_idx, module.gather_idx)
+        key_layer = SeqAllToAll4D.apply(module.ulysses_pg, key, module.scatter_idx, module.gather_idx)
+        value_layer = SeqAllToAll4D.apply(module.ulysses_pg, value, module.scatter_idx, module.gather_idx)
+        ulysses_rank = dist.get_rank(module.ulysses_pg)
+        sinks = sinks.chunk(ulysses_size, dim=0)[ulysses_rank].contiguous()
+    else:
+        query_layer = query
+        key_layer = key
+        value_layer = value
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(query_layer.size(-1))
+
+    block_seq_len = query_layer.shape[1] // 2
+    query0 = query_layer[:, :block_seq_len]
+    query1 = query_layer[:, block_seq_len:]
+    key_layer0 = key_layer[:, :block_seq_len]
+    key_layer1 = key_layer[:, block_seq_len:]
+    value_layer0 = value_layer[:, :block_seq_len]
+    value_layer1 = value_layer[:, block_seq_len:]
+
+    out = None
+    lse = None
+
+    next_k, next_v = None, None
+
+    original_window_size = window_size
+    chunk_len_zigzag = query_layer.shape[1] // 2
+
+    for step in range(comm.world_size):
+        current_is_early_stop = step == 2
+        next_is_early_stop = step == 1
+        if current_is_early_stop:
+            break
+        if step + 1 != comm.world_size and not next_is_early_stop:
+            next_k0: torch.Tensor = comm0.send_recv(key_layer0)
+            next_k1: torch.Tensor = comm1.send_recv(key_layer1)
+            next_v0: torch.Tensor = comm0.send_recv(value_layer0)
+            next_v1: torch.Tensor = comm1.send_recv(value_layer1)
+            comm0.commit()
+            comm1.commit()
+
+        key, value = key_layer, value_layer
+
+        if original_window_size[0] == -1:
+            adjusted_left = -1
+        else:
+            adjusted_left = original_window_size[0] - step * chunk_len_zigzag
+
+        adjusted_window_size = (adjusted_left, -1)
+
+        if step == 0:
+            print (f'rank {comm0.rank} step {step} doing full attention, qlen {query_layer.shape[1]}, klen {key.shape[1]}')
+            block_out, block_lse = triton_attention_forward(
+                query_layer,
+                key,
+                value,
+                sinks,
+                scale=softmax_scale,
+                is_causal=causal,
+                window_size=adjusted_window_size,
+            )
+            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+
+        elif step == 1:
+            if comm1.rank != 0:
+                print (f'rank {comm0.rank} step {step} doing left block attention, qlen {query0.shape[1]}, klen {key_layer0.shape[1]}')
+                block_out, block_lse = triton_attention_forward(
+                    query0,
+                    key_layer0,
+                    value_layer0,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=False,
+                    window_size=adjusted_window_size,
+                )
+                out, lse = update_out_and_lse(
+                    out,
+                    lse,
+                    block_out,
+                    block_lse,
+                    slice_=(slice(None), slice(None, block_seq_len)),
+                )
+            if comm1.rank != comm1.world_size - 1:
+                print (f'rank {comm0.rank} step {step} doing right block attention, qlen {query1.shape[1]}, klen {key_layer1.shape[1]}')
+                block_out, block_lse = triton_attention_forward(
+                    query1,
+                    key_layer1,
+                    value_layer1,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=False,
+                    window_size=adjusted_window_size,
+                )
+                out, lse = update_out_and_lse(
+                    out,
+                    lse,
+                    block_out,
+                    block_lse,
+                    slice_=(slice(None), slice(block_seq_len, None)),
+                )
+        else:
+            assert False, "Step should not be greater than 1 in balanced windowed attention."
+
+        if step + 1 != comm.world_size and not next_is_early_stop:
+            comm0.wait()
+            comm1.wait()
+            key_layer0 = next_k0
+            key_layer1 = next_k1
+            value_layer0 = next_v0
+            value_layer1 = next_v1
+
+    out = out.to(query.dtype)
+    if dist.get_world_size(module.ulysses_pg) > 1:
+        output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
+    else:
+        output = out
+
+    return output
+
+
+def _moreh_gpt_attention_balanced_full(
     module,
     query,
     key,
@@ -699,3 +865,60 @@ def moreh_gpt_attention_balanced(
         output = out
 
     return output
+
+def moreh_gpt_attention_balanced(
+    module,
+    query,
+    key,
+    value,
+    sinks,
+    *,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    is_kernel_bhsd: bool = True,
+) -> torch.Tensor:
+    assert module.use_pack_qkv is False, "Packed QKV is not supported in this attention implementation."
+    assert module.attn_type == AttnType.TORCH
+    assert window_size[1] == -1, "Balanced Ring Attention currently only supports left windowing."
+    assert causal is True, "Balanced Ring Attention requires causal=True."
+
+    return _moreh_gpt_attention_balanced_window(
+            module,
+            query,
+            key,
+            value,
+            sinks,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            is_kernel_bhsd=is_kernel_bhsd,
+        )
+
+    if window_size[0] == -1:
+        return _moreh_gpt_attention_balanced_full(
+            module,
+            query,
+            key,
+            value,
+            sinks,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            is_kernel_bhsd=is_kernel_bhsd,
+        )
+    else:
+        return _moreh_gpt_attention_balanced_window(
+            module,
+            query,
+            key,
+            value,
+            sinks,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            is_kernel_bhsd=is_kernel_bhsd,
+        )
