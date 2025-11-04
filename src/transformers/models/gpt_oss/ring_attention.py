@@ -330,7 +330,6 @@ def kernel_attention_contiguous_vllm_ported(
         l_j = tl.sum(p, 1)
         m_ij = tl.where(m_ij == float("-inf"), 0.0, m_ij)
 
-
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
 
@@ -409,7 +408,6 @@ def triton_attention_forward(
             num_kv_heads,
             triton.cdiv(q_seq_len, meta["BLOCK_Q_PER_HEAD"]),
         )
-
 
     PADDED_HEAD_SIZE = triton.next_power_of_2(head_size)
 
@@ -495,7 +493,7 @@ def moreh_gpt_attention(
         with torch.cuda.stream(comm_stream):
             comm.commit()
         comm.wait()
-        received_tensor += 1.
+        received_tensor += 1.0
         _WARMUPED = True
 
     if ulysses_size > 1:
@@ -600,8 +598,8 @@ def _moreh_gpt_attention_balanced_window(
     comm1 = RingComm(module.ring_pg)
     comm1.send_rank, comm1.recv_rank = comm1.recv_rank, comm1.send_rank
 
-    print (f'comm0 rank {comm0.rank} send_rank {comm0.send_rank} recv_rank {comm0.recv_rank}')
-    print (f'comm1 rank {comm1.rank} send_rank {comm1.send_rank} recv_rank {comm1.recv_rank}')
+    print(f"comm0 rank {comm0.rank} send_rank {comm0.send_rank} recv_rank {comm0.recv_rank}")
+    print(f"comm1 rank {comm1.rank} send_rank {comm1.send_rank} recv_rank {comm1.recv_rank}")
 
     global _WARMUPED
 
@@ -613,7 +611,7 @@ def _moreh_gpt_attention_balanced_window(
             with torch.cuda.stream(comm_stream):
                 comm.commit()
             comm.wait()
-            received_tensor += 1.
+            received_tensor += 1.0
         _WARMUPED = True
 
     if ulysses_size > 1:
@@ -669,7 +667,9 @@ def _moreh_gpt_attention_balanced_window(
         adjusted_window_size = (adjusted_left, -1)
 
         if step == 0:
-            print (f'rank {comm0.rank} step {step} doing full attention, qlen {query_layer.shape[1]}, klen {key.shape[1]}')
+            print(
+                f"rank {comm0.rank} step {step} doing full attention, qlen {query_layer.shape[1]}, klen {key.shape[1]}"
+            )
             block_out, block_lse = triton_attention_forward(
                 query_layer,
                 key,
@@ -683,7 +683,9 @@ def _moreh_gpt_attention_balanced_window(
 
         elif step == 1:
             if comm1.rank != 0:
-                print (f'rank {comm0.rank} step {step} doing left block attention, qlen {query0.shape[1]}, klen {key_layer0.shape[1]}')
+                print(
+                    f"rank {comm0.rank} step {step} doing left block attention, qlen {query0.shape[1]}, klen {key_layer0.shape[1]}"
+                )
                 block_out, block_lse = triton_attention_forward(
                     query0,
                     key_layer0,
@@ -701,7 +703,9 @@ def _moreh_gpt_attention_balanced_window(
                     slice_=(slice(None), slice(None, block_seq_len)),
                 )
             if comm1.rank != comm1.world_size - 1:
-                print (f'rank {comm0.rank} step {step} doing right block attention, qlen {query1.shape[1]}, klen {key_layer1.shape[1]}')
+                print(
+                    f"rank {comm0.rank} step {step} doing right block attention, qlen {query1.shape[1]}, klen {key_layer1.shape[1]}"
+                )
                 block_out, block_lse = triton_attention_forward(
                     query1,
                     key_layer1,
@@ -773,7 +777,7 @@ def _moreh_gpt_attention_balanced_full(
         with torch.cuda.stream(comm_stream):
             comm.commit()
         comm.wait()
-        received_tensor += 1.
+        received_tensor += 1.0
         _WARMUPED = True
 
     if ulysses_size > 1:
@@ -866,6 +870,7 @@ def _moreh_gpt_attention_balanced_full(
 
     return output
 
+
 def moreh_gpt_attention_balanced(
     module,
     query,
@@ -883,19 +888,6 @@ def moreh_gpt_attention_balanced(
     assert module.attn_type == AttnType.TORCH
     assert window_size[1] == -1, "Balanced Ring Attention currently only supports left windowing."
     assert causal is True, "Balanced Ring Attention requires causal=True."
-
-    return _moreh_gpt_attention_balanced_window(
-            module,
-            query,
-            key,
-            value,
-            sinks,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            is_kernel_bhsd=is_kernel_bhsd,
-        )
 
     if window_size[0] == -1:
         return _moreh_gpt_attention_balanced_full(

@@ -128,6 +128,7 @@ class RingAttentionTest(unittest.TestCase):
             v_total_trans,
             sinks,
             scale=softmax_scale,
+            window_size=window_size,
             is_causal=causal,
         )[0]
 

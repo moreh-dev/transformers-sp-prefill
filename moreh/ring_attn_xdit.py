@@ -119,7 +119,7 @@ def main():
 
     start_time = time.time()
 
-    _ = model.generate(local_input_ids, max_new_tokens=osl, do_sample=False)
+    out = model.generate(local_input_ids, max_new_tokens=osl, do_sample=False)
 
     # Synchronize after timing
     torch.cuda.synchronize()
@@ -138,6 +138,7 @@ def main():
         print(f"World Size:    {world_size} GPUs")
         print(f"Total Time:    {elapsed_time:.4f} seconds")
         print(f"Throughput:    {tokens_per_second:.2f} tokens/sec")
+        print(f"output_ids: {out}, shape: {out.shape}", flush=True)
 
 
 if __name__ == "__main__":
