@@ -639,6 +639,11 @@ def _moreh_gpt_attention_balanced_window(
     out = None
     lse = None
 
+    if comm0.rank != comm0.world_size - 1:
+        b, s, h, d = query_layer.shape
+        out = torch.zeros_like(query_layer)
+        lse = torch.full((b, s, h, 1), dtype=torch.float32, device=query_layer.device, fill_value=-float("inf"))
+
     next_k, next_v = None, None
 
     original_window_size = window_size
@@ -667,19 +672,84 @@ def _moreh_gpt_attention_balanced_window(
         adjusted_window_size = (adjusted_left, -1)
 
         if step == 0:
-            print(
-                f"rank {comm0.rank} step {step} doing full attention, qlen {query_layer.shape[1]}, klen {key.shape[1]}"
-            )
-            block_out, block_lse = triton_attention_forward(
-                query_layer,
-                key,
-                value,
-                sinks,
-                scale=softmax_scale,
-                is_causal=causal,
-                window_size=adjusted_window_size,
-            )
-            out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+            if comm0.rank == comm0.world_size - 1:
+                print(
+                    f"rank {comm0.rank} step {step} doing full attention, qlen {query_layer.shape[1]}, klen {key.shape[1]}"
+                )
+                block_out, block_lse = triton_attention_forward(
+                    query_layer,
+                    key,
+                    value,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=causal,
+                    window_size=adjusted_window_size,
+                )
+                assert torch.isnan(block_out).sum() == 0, (
+                    "NaN detected in block_out, rank {comm0.rank} step {step} full attention"
+                )
+                assert torch.isnan(block_lse).sum() == 0, (
+                    "NaN detected in block_lse, rank {comm0.rank} step {step} full attention"
+                )
+                out, lse = update_out_and_lse(out, lse, block_out, block_lse)
+                assert torch.isnan(out).sum() == 0, "NaN detected in out, rank {comm0.rank} step {step} full attention"
+                assert torch.isnan(lse).sum() == 0, "NaN detected in lse, rank {comm0.rank} step {step} full attention"
+            else:
+                print(
+                    f"rank {comm0.rank} step {step} doing left block attention, qlen {query0.shape[1]}, klen {key_layer0.shape[1]}"
+                )
+                block_out, block_lse = triton_attention_forward(
+                    query0,
+                    key_layer0,
+                    value_layer0,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=causal,
+                    window_size=adjusted_window_size,
+                )
+                assert torch.isnan(block_out).sum() == 0, (
+                    "NaN detected in block_out, rank {comm0.rank} step {step} left block"
+                )
+                assert torch.isnan(block_lse).sum() == 0, (
+                    "NaN detected in block_lse, rank {comm0.rank} step {step} left block"
+                )
+                out, lse = update_out_and_lse(
+                    out,
+                    lse,
+                    block_out,
+                    block_lse,
+                    slice_=(slice(None), slice(None, block_seq_len)),
+                )
+                assert torch.isnan(out).sum() == 0, "NaN detected in out, rank {comm0.rank} step {step} left block"
+                assert torch.isnan(lse).sum() == 0, "NaN detected in lse, rank {comm0.rank} step {step} left block"
+
+                print(
+                    f"rank {comm0.rank} step {step} doing right block attention, qlen {query1.shape[1]}, klen {key_layer1.shape[1]}"
+                )
+                block_out, block_lse = triton_attention_forward(
+                    query1,
+                    key_layer1,
+                    value_layer1,
+                    sinks,
+                    scale=softmax_scale,
+                    is_causal=causal,
+                    window_size=adjusted_window_size,
+                )
+                assert torch.isnan(block_out).sum() == 0, (
+                    "NaN detected in block_out, rank {comm0.rank} step {step} right block"
+                )
+                assert torch.isnan(block_lse).sum() == 0, (
+                    "NaN detected in block_lse, rank {comm0.rank} step {step} right block"
+                )
+                out, lse = update_out_and_lse(
+                    out,
+                    lse,
+                    block_out,
+                    block_lse,
+                    slice_=(slice(None), slice(block_seq_len, None)),
+                )
+                assert torch.isnan(out).sum() == 0, "NaN detected in out, rank {comm0.rank} step {step} right block"
+                assert torch.isnan(lse).sum() == 0, "NaN detected in lse, rank {comm0.rank} step {step} right block"
 
         elif step == 1:
             if comm1.rank != 0:
@@ -695,6 +765,12 @@ def _moreh_gpt_attention_balanced_window(
                     is_causal=False,
                     window_size=adjusted_window_size,
                 )
+                assert torch.isnan(block_out).sum() == 0, (
+                    "NaN detected in block_out, rank {comm0.rank} step {step} left block"
+                )
+                assert torch.isnan(block_lse).sum() == 0, (
+                    "NaN detected in block_lse, rank {comm0.rank} step {step} left block"
+                )
                 out, lse = update_out_and_lse(
                     out,
                     lse,
@@ -702,6 +778,8 @@ def _moreh_gpt_attention_balanced_window(
                     block_lse,
                     slice_=(slice(None), slice(None, block_seq_len)),
                 )
+                assert torch.isnan(out).sum() == 0, "NaN detected in out, rank {comm0.rank} step {step} left block"
+                assert torch.isnan(lse).sum() == 0, "NaN detected in lse, rank {comm0.rank} step {step} left block"
             if comm1.rank != comm1.world_size - 1:
                 print(
                     f"rank {comm0.rank} step {step} doing right block attention, qlen {query1.shape[1]}, klen {key_layer1.shape[1]}"
@@ -715,6 +793,12 @@ def _moreh_gpt_attention_balanced_window(
                     is_causal=False,
                     window_size=adjusted_window_size,
                 )
+                assert torch.isnan(block_out).sum() == 0, (
+                    "NaN detected in block_out, rank {comm0.rank} step {step} right block"
+                )
+                assert torch.isnan(block_lse).sum() == 0, (
+                    "NaN detected in block_lse, rank {comm0.rank} step {step} right block"
+                )
                 out, lse = update_out_and_lse(
                     out,
                     lse,
@@ -722,6 +806,8 @@ def _moreh_gpt_attention_balanced_window(
                     block_lse,
                     slice_=(slice(None), slice(block_seq_len, None)),
                 )
+                assert torch.isnan(out).sum() == 0, "NaN detected in out, rank {comm0.rank} step {step} right block"
+                assert torch.isnan(lse).sum() == 0, "NaN detected in lse, rank {comm0.rank} step {step} right block"
         else:
             assert False, "Step should not be greater than 1 in balanced windowed attention."
 
