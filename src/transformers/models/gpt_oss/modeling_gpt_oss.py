@@ -25,6 +25,7 @@ from torch import nn
 from torch.nn import functional as F
 from xfuser.core.distributed import (
     get_pp_group,
+    get_sp_group,
     get_sequence_parallel_rank,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
@@ -515,10 +516,6 @@ class GptOssModel(GptOssPreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
-        # hidden_states = get_sp_group().all_gather(hidden_states, dim=1)
-        if get_pp_group().is_last_rank:
-            hidden_states = all_gather_zigzag(hidden_states)
-
         return MoeModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
@@ -691,6 +688,11 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        if get_sp_group().world_size > 1 and get_pp_group().is_last_rank:
+            hidden_states = get_sp_group().all_gather(hidden_states[:, slice_indices, :], dim=1)
+            slice_indices = slice(0, logits_to_keep)
+
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
         loss = None
