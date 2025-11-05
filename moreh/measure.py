@@ -56,17 +56,17 @@ def validate_args(args, config):
 
     if not is_distributed:
         # Single device mode
-        if args.sp_size != 1 or args.pp_size != 1:
+        if args.ring_size != 1 or args.ulysses_size or args.pp_size != 1:
             raise ValueError(
-                "Single device mode requires sp_size=1 and pp_size=1. Use torchrun for distributed execution."
+                "Single device mode requires ring_size=1, ulysses_size=1 and pp_size=1. Use torchrun for distributed execution."
             )
     else:
         # Distributed mode
         world_size = int(os.environ["WORLD_SIZE"])
-        expected_world_size = args.sp_size * args.pp_size
+        expected_world_size = args.ring_size * args.ulysses_size * args.pp_size
         if world_size != expected_world_size:
             raise ValueError(
-                f"World size ({world_size}) must equal SP size ({args.sp_size}) * PP size ({args.pp_size})"
+                f"World size ({world_size}) must equal SP size ({args.ring_size} * {args.ulysses_size}) * PP size ({args.pp_size})"
             )
 
     # Validate split points for pipeline parallel
@@ -94,7 +94,7 @@ def validate_args(args, config):
                     )
 
 
-def init_distributed(sp_size, pp_size):
+def init_distributed(ring_size, ulysses_size, pp_size):
     """Initialize distributed environment and create device mesh."""
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # Distributed mode
@@ -110,15 +110,15 @@ def init_distributed(sp_size, pp_size):
             world_size=world_size,
         )
         initialize_model_parallel(
-            sequence_parallel_degree=sp_size,
-            ring_degree=1,
-            ulysses_degree=sp_size,
+            sequence_parallel_degree=ring_size * ulysses_size,
+            ring_degree=ring_size,
+            ulysses_degree=ulysses_size,
             pipeline_parallel_degree=pp_size,
         )
 
         pp_group = get_pp_group()
         sp_group = get_sp_group()
-        mesh = torch.arange(world_size).reshape(pp_size, sp_size)
+        mesh = torch.arange(world_size).reshape(pp_size, ring_size * ulysses_size)
 
         device_mesh = DeviceMesh.from_group(
             group=[pp_group.device_group, sp_group.device_group],
@@ -494,10 +494,16 @@ def main():
         help="Output sequence lengths to test (e.g., 1 2 4 8 16)"
     )
     parser.add_argument(
-        "--sp-size",
+        "--ring-size",
         type=int,
         default=1,
-        help="Sequence parallel size"
+        help="Ring (sequence parallel) size"
+    )
+    parser.add_argument(
+        "--ulysses-size",
+        type=int,
+        default=1,
+        help="Ulysses (sequence parallel) size"
     )
     parser.add_argument(
         "--pp-size",
@@ -526,7 +532,7 @@ def main():
     validate_args(args, config)
 
     # Initialize distributed environment
-    device, device_mesh = init_distributed(args.sp_size, args.pp_size)
+    device, device_mesh = init_distributed(args.ring_size, args.ulysses_size, args.pp_size)
 
     input_ids = prepare_input(config.vocab_size, args.input_length, device, device_mesh)
 
