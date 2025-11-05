@@ -111,8 +111,8 @@ def init_distributed(sp_size, pp_size):
         )
         initialize_model_parallel(
             sequence_parallel_degree=sp_size,
-            ring_degree=sp_size,
-            ulysses_degree=1,
+            ring_degree=1,
+            ulysses_degree=sp_size,
             pipeline_parallel_degree=pp_size,
         )
 
@@ -321,6 +321,7 @@ def apply_pipeline_parallel(model, device_mesh, device, stage_modules):
         device_mesh.get_group(),
     )
     model_chunk.eval()
+    model_chunk._use_pipeline_parallel = True
 
     pp_schedule = _ScheduleForwardOnly(
         stage,

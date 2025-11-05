@@ -612,6 +612,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
+    _use_pipeline_parallel = False
 
     def __init__(self, config):
         super().__init__(config)
@@ -644,7 +645,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         use_cache: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        logits_to_keep: Union[int, torch.Tensor] = 1,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeCausalLMOutputWithPast:
         r"""
@@ -675,7 +676,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         )
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        hidden_states = self.model(
+        outputs: MoeModelOutputWithPast = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -687,6 +688,7 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
+        hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
@@ -706,7 +708,18 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
             if labels is not None:
                 loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
 
-        return hidden_states
+        if self._use_pipeline_parallel:
+            return hidden_states
+
+        return MoeCausalLMOutputWithPast(
+            loss=loss,
+            aux_loss=aux_loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            router_logits=outputs.router_logits,
+        )
 
 
 __all__ = ["GptOssForCausalLM", "GptOssModel", "GptOssPreTrainedModel"]
