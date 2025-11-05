@@ -934,6 +934,7 @@ def _moreh_gpt_attention_balanced_full(
             comm.wait()
             key_layer = next_k
             value_layer = next_v
+
     out = out.to(query.dtype)
     if dist.get_world_size(module.ulysses_pg) > 1:
         output = SeqAllToAll4D.apply(module.ulysses_pg, out, module.gather_idx, module.scatter_idx)
