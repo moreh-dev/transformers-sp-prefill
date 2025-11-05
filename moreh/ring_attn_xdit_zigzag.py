@@ -3,7 +3,11 @@ import time
 
 import torch
 import torch.distributed as dist
+import yunchang.comm.extract_local
 from xfuser.core.distributed import (
+    get_ring_parallel_world_size,
+    get_sequence_parallel_world_size,
+    get_ulysses_parallel_world_size,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -53,11 +57,22 @@ def main():
     # The model code itself MUST have the Ring Attention logic implemented.
     # We are NOT using device_map here.
 
-    isl = 1024 * 8
+    isl = 1024 * 2
     input_ids = torch.randint(0, tokenizer.vocab_size, (1, isl)).to(device)
     dist.broadcast(input_ids, src=0)
 
-    local_input_ids = torch.empty(1, isl // world_size, dtype=input_ids.dtype).to(device)
+    local_input_ids = (
+        yunchang.comm.extract_local.EXTRACT_FUNC_DICT["zigzag"](
+            input_ids,
+            -1,  # rank, but not used
+            world_size=get_sequence_parallel_world_size(),
+            rd=get_ring_parallel_world_size(),
+            ud=get_ulysses_parallel_world_size(),
+            dim=1,
+        )
+        .detach()
+        .clone()
+    )
 
     if rank == 0:
         print(input_ids)
