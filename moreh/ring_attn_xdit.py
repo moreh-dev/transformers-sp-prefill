@@ -1,9 +1,15 @@
+import argparse
 import os
 import time
 
 import torch
 import torch.distributed as dist
+import yunchang.comm.extract_local
 from xfuser.core.distributed import (
+    get_ring_parallel_world_size,
+    get_sequence_parallel_rank,
+    get_sequence_parallel_world_size,
+    get_ulysses_parallel_world_size,
     init_distributed_environment,
     initialize_model_parallel,
 )
@@ -32,8 +38,7 @@ def setup_distributed():
     )
 
 
-def main():
-    # 1. Set up the distributed environment
+def main(layout: str = "basic"):
     torch.manual_seed(2)
 
     setup_distributed()
@@ -45,19 +50,34 @@ def main():
         print(f"--- Starting benchmark on {world_size} GPUs ---")
 
     model_id = "/root/.cache/huggingface/hub/gpt-oss-120b/"
-
-    # Each process loads the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # 2. Load the model onto the specific GPU for each process
-    # The model code itself MUST have the Ring Attention logic implemented.
-    # We are NOT using device_map here.
-
-    isl = 1024 * 8
+    isl = 1024 * 2
     input_ids = torch.randint(0, tokenizer.vocab_size, (1, isl)).to(device)
+    input_ids = torch.arange(input_ids.numel()).view(input_ids.size()).to(device)
+
     dist.broadcast(input_ids, src=0)
 
-    local_input_ids = torch.empty(1, isl // world_size, dtype=input_ids.dtype).to(device)
+    print(f"layout: {layout}, rank: {rank}, input_ids shape: {input_ids.shape}")
+    os.environ["LAYOUT"] = layout
+    extract_func = yunchang.comm.extract_local.EXTRACT_FUNC_DICT.get(layout)
+    if extract_func is None:
+        raise ValueError(
+            f"Unknown layout '{layout}', available: {list(yunchang.comm.extract_local.EXTRACT_FUNC_DICT.keys())}"
+        )
+
+    local_input_ids = (
+        extract_func(
+            input_ids,
+            get_sequence_parallel_rank(),
+            world_size=get_sequence_parallel_world_size(),
+            rd=get_ring_parallel_world_size(),
+            ud=get_ulysses_parallel_world_size(),
+            dim=1,
+        )
+        .detach()
+        .clone()
+    )
 
     if rank == 0:
         print(input_ids)
@@ -69,28 +89,13 @@ def main():
     )
     model.eval()
 
-    # num_layers = len(model.model.layers)
-    # model.model.layers = model.model.layers[:num_layers//4]
-    # del(model.model.layers[num_layers//4:])
-    # import gc
-    # gc.collect()
-    # torch.cuda.empty_cache()
-
-    # torch.compile can be added here if desired, but test without it first.
     model = torch.compile(model)
 
-    # Input sequence length must be divisible by world_size for Ring Attention
     if isl % world_size != 0:
         if rank == 0:
             print(f"Error: Input sequence length {isl} is not divisible by world_size {world_size}.")
         return
 
-    if rank == 0:
-        dist.scatter(local_input_ids, list(input_ids.chunk(world_size, 1)), src=0)
-    else:
-        dist.scatter(local_input_ids, None, src=0)
-
-    # The output sequence length for the benchmark
     osl = 1  # Example fixed output length
 
     # --- Warm-up Run ---
@@ -142,4 +147,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--layout", type=str, default="basic", help="layout type: basic, zigzag, etc.")
+    args = parser.parse_args()
+    main(layout=args.layout)

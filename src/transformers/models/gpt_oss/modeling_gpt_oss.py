@@ -18,6 +18,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional, Union
 
 import torch
@@ -25,8 +26,8 @@ from torch import nn
 from torch.nn import functional as F
 from xfuser.core.distributed import (
     get_pp_group,
-    get_sp_group,
     get_sequence_parallel_rank,
+    get_sp_group,
 )
 from xfuser.core.long_ctx_attention import xFuserLongContextAttention
 from yunchang.kernels import AttnType
@@ -43,7 +44,36 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
-from .ring_attention import all_gather_zigzag, moreh_gpt_attention_balanced
+from .ring_attention import all_gather_zigzag, moreh_gpt_attention, moreh_gpt_attention_balanced
+
+
+once_flag = False
+
+
+def save_tensor(tensor, path, seq_dim=1):
+    os.makedirs(os.path.dirname(path), exist_ok=True)  # ✅ 디렉터리만 생성
+    layout = os.environ.get("LAYOUT", None)
+    assert layout in ["basic", "zigzag"], f"Unknown LAYOUT '{layout}'"
+
+    zigzag = layout == "zigzag"
+
+    global once_flag
+    if not once_flag:
+        print(f"zigzag: {zigzag}")
+        once_flag = True
+
+    sp_group = get_sp_group()
+    if sp_group.world_size == 0:
+        torch.save(tensor, path)
+        return
+
+    if zigzag:
+        gathered_tensor = all_gather_zigzag(tensor.contiguous(), dim=seq_dim)
+    else:
+        gathered_tensor = sp_group.all_gather(tensor.contiguous(), dim=seq_dim)
+
+    if get_sequence_parallel_rank() == 0:
+        torch.save(gathered_tensor, path)
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -190,7 +220,8 @@ class GptOssRotaryEmbedding(nn.Module):
     def forward(self, x, position_ids):
         sp_rank = get_sequence_parallel_rank()
         local_seq_len = int(position_ids.shape[-1])
-        position_ids += sp_rank * local_seq_len
+        # position_ids += sp_rank * local_seq_len
+        position_ids.fill_(1.0)
 
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -304,6 +335,7 @@ class GptOssAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        save_tensor(hidden_states, f"kv_cache/hidden_states_layer_{self.layer_idx}.pt", seq_dim=1)
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -311,12 +343,21 @@ class GptOssAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        save_tensor(query_states, f"kv_cache/query_states_pre_rope_layer_{self.layer_idx}.pt", seq_dim=2)
+        save_tensor(key_states, f"kv_cache/key_states_pre_rope_layer_{self.layer_idx}.pt", seq_dim=2)
+        save_tensor(value_states, f"kv_cache/value_states_pre_rope_layer_{self.layer_idx}.pt", seq_dim=2)
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        save_tensor(query_states, f"kv_cache/query_states_post_rope_layer_{self.layer_idx}.pt", seq_dim=2)
+        save_tensor(key_states, f"kv_cache/key_states_post_rope_layer_{self.layer_idx}.pt", seq_dim=2)
 
         if past_key_value is not None:
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            save_tensor(key_states, f"kv_cache/key_states_layer_after_update_{self.layer_idx}.pt", seq_dim=2)
+            save_tensor(value_states, f"kv_cache/value_states_layer_after_update_{self.layer_idx}.pt", seq_dim=2)
 
         causal = True
 
@@ -326,7 +367,7 @@ class GptOssAttention(nn.Module):
             window_size = (-1, -1)
 
         attn_class = xFuserLongContextAttention(attn_type=AttnType.TORCH)
-        attn_fn = moreh_gpt_attention_balanced  # if window_size == (-1, -1) else moreh_gpt_attention
+        attn_fn = moreh_gpt_attention if os.environ.get("LAYOUT", "basic") == "basic" else moreh_gpt_attention_balanced
         attn_output = attn_fn(
             attn_class,
             query_states,
@@ -339,6 +380,7 @@ class GptOssAttention(nn.Module):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        save_tensor(attn_output, f"kv_cache/attn_output_layer_{self.layer_idx}.pt", seq_dim=1)
         attn_output = self.o_proj(attn_output)
         return attn_output
 
@@ -468,6 +510,7 @@ class GptOssModel(GptOssPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> MoeModelOutputWithPast:
+        save_tensor(input_ids, "kv_cache/input_ids.pt", seq_dim=1)
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
