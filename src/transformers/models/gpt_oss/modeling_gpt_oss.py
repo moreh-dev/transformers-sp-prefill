@@ -46,11 +46,19 @@ from ...utils.generic import OutputRecorder, check_model_inputs
 from .configuration_gpt_oss import GptOssConfig
 from .ring_attention import all_gather_zigzag, moreh_gpt_attention, moreh_gpt_attention_balanced
 
+from xfuser.core.distributed import (
+    get_ring_parallel_rank,
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
+)
+
 
 once_flag = False
 
 
 def save_tensor(tensor, path, seq_dim=1):
+    return
     os.makedirs(os.path.dirname(path), exist_ok=True)  # ✅ 디렉터리만 생성
     layout = os.environ.get("LAYOUT", None)
     assert layout in ["basic", "zigzag"], f"Unknown LAYOUT '{layout}'"
@@ -218,10 +226,67 @@ class GptOssRotaryEmbedding(nn.Module):
     @torch.no_grad()
     @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
     def forward(self, x, position_ids):
-        sp_rank = get_sequence_parallel_rank()
+        def get_zigzag_pos_id(local_seq_len: int) -> torch.Tensor:
+            rd = get_ring_parallel_world_size()
+            ud = get_ulysses_parallel_world_size()
+            r_rank = get_ring_parallel_rank()
+            u_rank = get_ulysses_parallel_rank()
+            
+            world_size = rd * ud
+            
+            # 2. 전체 시퀀스 길이 계산
+            # (local_seq_len = total_seq_len / world_size 이므로)
+            total_seq_len = local_seq_len * world_size
+            
+            # 3. 'zigzag_extract' 로직에 따라, 
+            #    total_seq_len을 2 * rd 개의 작은 청크로 나눴을 때의 크기 계산
+            if (total_seq_len % (2 * rd)) != 0:
+                raise ValueError(
+                    f"Total sequence length ({total_seq_len}) must be divisible by 2 * ring_degree ({2 * rd})"
+                )
+            small_chunk_size = total_seq_len // (2 * rd)
+            
+            # 4. 현재 r_rank가 가져올 두 개의 청크 시작 인덱스 계산
+            # 첫 번째 청크: value_chunks[r_rank]
+            start_idx_1 = r_rank * small_chunk_size
+            
+            # 두 번째 청크: value_chunks[2 * rd - r_rank - 1]
+            start_idx_2 = (2 * rd - r_rank - 1) * small_chunk_size
+            
+            # 5. 두 청크에 해당하는 글로벌 position ID 생성
+            # (dtype=torch.long은 인덱싱/임베딩에 사용되므로 중요합니다)
+            pos_ids_1 = torch.arange(
+                start_idx_1, start_idx_1 + small_chunk_size, dtype=torch.long
+            )
+            pos_ids_2 = torch.arange(
+                start_idx_2, start_idx_2 + small_chunk_size, dtype=torch.long
+            )
+            
+            # 6. 두 position ID 텐서를 concat (링 그룹 전체의 pos id)
+            # [r_rank_chunk, (2*rd - r_rank - 1)_chunk]
+            combined_pos_ids = torch.cat([pos_ids_1, pos_ids_2])
+            
+            # 7. 링 그룹의 pos id를 'ud'개로 나누고, 현재 u_rank의 조각을 선택
+            # .chunk(ud)는 텐서를 'ud'개의 조각으로 나눕니다.
+            local_pos_ids_chunks = combined_pos_ids.chunk(ud)
+            local_pos_ids = local_pos_ids_chunks[u_rank]
+            
+            # 최종 길이는 local_seq_len과 일치해야 합니다.
+            assert local_pos_ids.shape[0] == local_seq_len
+            
+            return local_pos_ids
+        
         local_seq_len = int(position_ids.shape[-1])
-        # position_ids += sp_rank * local_seq_len
-        position_ids.fill_(1.0)
+
+        if os.environ.get("LAYOUT", None) == "basic":
+            sp_rank = get_sequence_parallel_rank()
+            local_seq_len = int(position_ids.shape[-1])
+            position_ids += sp_rank * local_seq_len
+        else:
+            assert os.environ.get("LAYOUT", None) == "zigzag", f"Unknown LAYOUT '{os.environ.get('LAYOUT', None)}'"
+            position_ids = get_zigzag_pos_id(local_seq_len).unsqueeze(0).to(x.device)
+            print (f"rank: {get_ring_parallel_rank()}, local_seq_len: {local_seq_len}, position_ids: {position_ids}")
+        #position_ids.fill_(1.0)
 
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
         position_ids_expanded = position_ids[:, None, :].float()
