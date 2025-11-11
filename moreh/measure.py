@@ -30,7 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def prepare_input(vocab_size, input_length, device, device_mesh):
+def prepare_input(batch_size, vocab_size, input_length, device, device_mesh):
     if device_mesh is not None:
         pp_mesh = device_mesh["pp"]
         sp_mesh = device_mesh["sp"]
@@ -40,13 +40,13 @@ def prepare_input(vocab_size, input_length, device, device_mesh):
         pp_size = pp_mesh.size()
         sp_size = sp_mesh.size()
         sp_rank = sp_mesh.get_local_rank()
-        input_ids = torch.randint(0, vocab_size, (pp_size, input_length)).to(device)
+        input_ids = torch.randint(0, vocab_size, (pp_size * batch_size, input_length)).to(device)
         if sp_size > 1:
             dist.broadcast(input_ids, group=sp_mesh.get_group(), group_src=0)
-            input_ids = input_ids.chunk(sp_size, dim=1)[sp_rank]
+            input_ids = input_ids.chunk(sp_size, dim=1)[sp_rank].contiguous()
         return input_ids
     else:
-        return torch.randint(0, vocab_size, (1, input_length)).to(device)
+        return torch.randint(0, vocab_size, (batch_size, input_length)).to(device)
 
 
 def validate_args(args, config):
@@ -129,6 +129,7 @@ def init_distributed(ring_size, ulysses_size, pp_size):
 
         logger.info(f"Rank {rank}/{world_size} | Local rank: {local_rank} | Device: {device}")
         logger.info(f"Device mesh created: {device_mesh}")
+        logger.info(f"Parallelism Config: [pp={pp_size}, ring={ring_size}, ulysses={ulysses_size}]")
         return device, device_mesh
     else:
         # Single device mode
@@ -374,12 +375,13 @@ def measure_performance(model, input_ids, output_sequence_lengths, num_iteration
 
         # Warm-up
         logger.info("Running warm-up...")
-        _ = model.generate(
-            input_ids,
-            max_new_tokens=osl,
-            do_sample=False,
-        )
-        torch.cuda.synchronize()
+        for _ in range(3):
+            _ = model.generate(
+                input_ids,
+                max_new_tokens=osl,
+                do_sample=False,
+            )
+            torch.cuda.synchronize()
         logger.info("Warm-up complete.")
 
         # Measurement iterations
@@ -416,11 +418,12 @@ def measure_pipeline_parallel_performance(pp_schedule, has_first_stage, input_id
 
         # Warm-up
         logger.info("Running warm-up...")
-        if has_first_stage:
-            output = pp_schedule.step(input_ids)
-        else:
-            output = pp_schedule.step()
-        torch.cuda.synchronize()
+        for i in range(3):
+            if has_first_stage:
+                output = pp_schedule.step(input_ids)
+            else:
+                output = pp_schedule.step()
+            torch.cuda.synchronize()
         dist.barrier()
         logger.info("Warm-up complete.")
 
@@ -524,6 +527,12 @@ def main():
         default=None,
         help="Custom split points for pipeline parallel stages (must provide pp_size-1 values)."
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="batch size"
+    )
 
     args = parser.parse_args()
     config = AutoConfig.from_pretrained(args.model)
@@ -534,7 +543,7 @@ def main():
     # Initialize distributed environment
     device, device_mesh = init_distributed(args.ring_size, args.ulysses_size, args.pp_size)
 
-    input_ids = prepare_input(config.vocab_size, args.input_length, device, device_mesh)
+    input_ids = prepare_input(args.batch_size, config.vocab_size, args.input_length, device, device_mesh)
 
     if args.pp_size > 1:
         # Pipeline parallel mode

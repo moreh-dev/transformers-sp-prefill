@@ -697,10 +697,10 @@ def _moreh_gpt_attention_balanced_window(
         if current_is_early_stop:
             break
         if step + 1 != comm0.world_size and not next_is_early_stop:
-            next_k0: torch.Tensor = comm0.send_recv(key_layer0)
-            next_k1: torch.Tensor = comm1.send_recv(key_layer1)
-            next_v0: torch.Tensor = comm0.send_recv(value_layer0)
-            next_v1: torch.Tensor = comm1.send_recv(value_layer1)
+            next_k0: torch.Tensor = comm0.send_recv(key_layer0.contiguous())
+            next_k1: torch.Tensor = comm1.send_recv(key_layer1.contiguous())
+            next_v0: torch.Tensor = comm0.send_recv(value_layer0.contiguous())
+            next_v1: torch.Tensor = comm1.send_recv(value_layer1.contiguous())
             comm0.commit()
             comm1.commit()
 

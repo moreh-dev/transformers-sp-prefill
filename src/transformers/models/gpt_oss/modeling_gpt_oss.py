@@ -686,11 +686,12 @@ class GptOssForCausalLM(GptOssPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
+
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
 
         if get_sp_group().world_size > 1 and get_pp_group().is_last_rank:
-            hidden_states = get_sp_group().all_gather(hidden_states[:, slice_indices, :], dim=1)
+            hidden_states = get_sp_group().all_gather(hidden_states[:, slice_indices, :].contiguous(), dim=1)
             slice_indices = slice(0, logits_to_keep)
 
         logits = self.lm_head(hidden_states[:, slice_indices, :])
