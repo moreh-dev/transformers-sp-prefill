@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 import yunchang.comm.extract_local
 import yunchang.ring.utils
+from flash_attn import flash_attn_func
 from xfuser.core.distributed import (
     get_ring_parallel_rank,
     get_ring_parallel_world_size,
@@ -508,6 +509,46 @@ def triton_attention_forward(
     return output, lse_output
 
 
+def call_block_attn(
+    query,
+    key,
+    value,
+    sinks,
+    softmax_scale,
+    causal,
+    window_size,
+):
+    attn = "flash"
+
+    if window_size != (-1, -1):
+        attn = "triton"
+
+    if attn == "flash":
+        out, lse, _ = flash_attn_func(
+            query,
+            key,
+            value,
+            sinks,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            return_attn_probs=True,
+        )
+    elif attn == "triton":
+        out, lse = triton_attention_forward(
+            query,
+            key,
+            value,
+            sinks,
+            scale=softmax_scale,
+            is_causal=causal,
+            window_size=window_size,
+        )
+    else:
+        raise ValueError(f"Unsupported attention type: {attn}")
+    return out, lse
+
+
 def moreh_gpt_attention(
     module,
     query,
@@ -592,14 +633,14 @@ def moreh_gpt_attention(
         adjusted_window_size = (adjusted_left, adjusted_right)
 
         if not causal or step <= comm.rank:
-            block_out, block_lse = triton_attention_forward(
+            block_out, block_lse = call_block_attn(
                 query_layer,
                 key,
                 value,
                 sinks,
-                scale=softmax_scale,
-                is_causal=causal and step == 0,
-                window_size=adjusted_window_size,
+                softmax_scale,
+                causal and step == 0,
+                adjusted_window_size,
             )
 
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
@@ -715,25 +756,25 @@ def _moreh_gpt_attention_balanced_window(
 
         if step == 0:
             if comm0.rank == comm0.world_size - 1:
-                block_out, block_lse = triton_attention_forward(
+                block_out, block_lse = call_block_attn(
                     query_layer,
                     key,
                     value,
                     sinks,
-                    scale=softmax_scale,
-                    is_causal=causal,
-                    window_size=adjusted_window_size,
+                    softmax_scale,
+                    causal,
+                    adjusted_window_size,
                 )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
             else:
-                block_out, block_lse = triton_attention_forward(
+                block_out, block_lse = call_block_attn(
                     query0,
                     key_layer0,
                     value_layer0,
                     sinks,
-                    scale=softmax_scale,
-                    is_causal=causal,
-                    window_size=adjusted_window_size,
+                    softmax_scale,
+                    causal,
+                    adjusted_window_size,
                 )
                 out, lse = update_out_and_lse(
                     out,
@@ -743,14 +784,14 @@ def _moreh_gpt_attention_balanced_window(
                     slice_=(slice(None), slice(None, block_seq_len)),
                 )
 
-                block_out, block_lse = triton_attention_forward(
+                block_out, block_lse = call_block_attn(
                     query1,
                     key_layer1,
                     value_layer1,
                     sinks,
-                    scale=softmax_scale,
-                    is_causal=causal,
-                    window_size=adjusted_window_size,
+                    softmax_scale,
+                    causal,
+                    adjusted_window_size,
                 )
                 out, lse = update_out_and_lse(
                     out,
@@ -762,14 +803,14 @@ def _moreh_gpt_attention_balanced_window(
 
         elif step == 1:
             if comm1.rank != 0:
-                block_out, block_lse = triton_attention_forward(
+                block_out, block_lse = call_block_attn(
                     query0,
                     key_layer0,
                     value_layer0,
                     sinks,
-                    scale=softmax_scale,
-                    is_causal=False,
-                    window_size=adjusted_window_size,
+                    softmax_scale,
+                    False,
+                    adjusted_window_size,
                 )
                 out, lse = update_out_and_lse(
                     out,
@@ -779,14 +820,14 @@ def _moreh_gpt_attention_balanced_window(
                     slice_=(slice(None), slice(None, block_seq_len)),
                 )
             if comm1.rank != comm1.world_size - 1:
-                block_out, block_lse = triton_attention_forward(
+                block_out, block_lse = call_block_attn(
                     query1,
                     key_layer1,
                     value_layer1,
                     sinks,
-                    scale=softmax_scale,
-                    is_causal=False,
-                    window_size=adjusted_window_size,
+                    softmax_scale,
+                    False,
+                    adjusted_window_size,
                 )
                 out, lse = update_out_and_lse(
                     out,
@@ -876,6 +917,7 @@ def _moreh_gpt_attention_balanced_full(
 
     next_k, next_v = None, None
 
+    window_size = (-1, -1)
     for step in range(comm.world_size):
         if step + 1 != comm.world_size:
             next_k: torch.Tensor = comm.send_recv(key_layer)
@@ -885,14 +927,14 @@ def _moreh_gpt_attention_balanced_full(
         key, value = key_layer, value_layer
 
         if step == 0:
-            block_out, block_lse = triton_attention_forward(
+            block_out, block_lse = call_block_attn(
                 query_layer,
                 key,
                 value,
                 sinks,
-                scale=softmax_scale,
-                is_causal=causal,
-                window_size=window_size,
+                softmax_scale,
+                causal,
+                window_size,
             )
             out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
@@ -901,26 +943,26 @@ def _moreh_gpt_attention_balanced_full(
             value0 = value[:, :block_seq_len]
 
             if key0.shape[1] > 0:
-                block_out, block_lse = triton_attention_forward(
+                block_out, block_lse = call_block_attn(
                     query_layer,
                     key0,
                     value0,
                     sinks,
-                    scale=softmax_scale,
-                    is_causal=False,
-                    window_size=window_size,
+                    softmax_scale,
+                    False,
+                    window_size,
                 )
                 out, lse = update_out_and_lse(out, lse, block_out, block_lse)
 
         else:
-            block_out, block_lse = triton_attention_forward(
+            block_out, block_lse = call_block_attn(
                 query1,
                 key,
                 value,
                 sinks,
-                scale=softmax_scale,
-                is_causal=False,
-                window_size=window_size,
+                softmax_scale,
+                False,
+                window_size,
             )
             out, lse = update_out_and_lse(
                 out,
