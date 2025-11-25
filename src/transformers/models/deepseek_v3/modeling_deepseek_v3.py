@@ -30,6 +30,104 @@ from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
 from ...utils.generic import check_model_inputs
 from .configuration_deepseek_v3 import DeepseekV3Config
+import torch.distributed as dist
+
+_TP_GROUP = None
+_PP_GROUP = None
+
+def set_tp_group(group):
+    global _TP_GROUP
+    _TP_GROUP = group
+
+def get_tp_group():
+    return _TP_GROUP
+
+def set_pp_group(group):
+    global _PP_GROUP
+    _PP_GROUP = group
+
+def get_pp_group():
+    return _PP_GROUP
+
+def get_pp_rank():
+    if not dist.is_initialized() or _PP_GROUP is None:
+        return 0
+    return dist.get_rank(group=_PP_GROUP)
+
+def get_pp_world_size():
+    if not dist.is_initialized() or _PP_GROUP is None:
+        return 1
+    return dist.get_world_size(group=_PP_GROUP)
+
+def get_next_pp_rank():
+    rank = get_pp_rank()
+    world = get_pp_world_size()
+    return (rank + 1) % world # Note: usually PP is linear, so rank+1. 
+
+def get_prev_pp_rank():
+    rank = get_pp_rank()
+    world = get_pp_world_size()
+    return (rank - 1) % world
+
+class ColumnParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True, gather_output=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.gather_output = gather_output
+        self.process_group = get_tp_group()
+        self.tp_size = dist.get_world_size(group=self.process_group) if self.process_group else 1
+        self.tp_rank = dist.get_rank(group=self.process_group) if self.process_group else 0
+        
+        self.output_size_per_partition = out_features // self.tp_size
+        self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(self.output_size_per_partition))
+        else:
+            self.register_parameter('bias', None)
+        
+        # Init weights
+        nn.init.xavier_normal_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, input):
+        output = F.linear(input, self.weight, self.bias)
+        if self.gather_output and self.tp_size > 1:
+            # All-gather output
+            outputs = [torch.empty_like(output) for _ in range(self.tp_size)]
+            dist.all_gather(outputs, output, group=self.process_group)
+            output = torch.cat(outputs, dim=-1)
+        return output
+
+class RowParallelLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.process_group = get_tp_group()
+        self.tp_size = dist.get_world_size(group=self.process_group) if self.process_group else 1
+        self.tp_rank = dist.get_rank(group=self.process_group) if self.process_group else 0
+        
+        self.input_size_per_partition = in_features // self.tp_size
+        self.weight = nn.Parameter(torch.empty(out_features, self.input_size_per_partition))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter('bias', None)
+            
+        nn.init.xavier_normal_(self.weight)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+    def forward(self, input):
+        output = F.linear(input, self.weight)
+        if self.tp_size > 1:
+            dist.all_reduce(output, group=self.process_group)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
 
 
 @use_kernel_forward_from_hub("RMSNorm")
@@ -95,9 +193,10 @@ class DeepseekV3MLP(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        
+        self.gate_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -344,11 +443,11 @@ class DeepseekV3Attention(nn.Module):
 
         self.is_causal = True
         if self.q_lora_rank is None:
-            self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+            self.q_proj = ColumnParallelLinear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
             self.q_a_layernorm = DeepseekV3RMSNorm(config.q_lora_rank)
-            self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+            self.q_b_proj = ColumnParallelLinear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
 
         self.kv_a_proj_with_mqa = nn.Linear(
             config.hidden_size,
@@ -356,13 +455,13 @@ class DeepseekV3Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = DeepseekV3RMSNorm(self.kv_lora_rank)
-        self.kv_b_proj = nn.Linear(
+        self.kv_b_proj = ColumnParallelLinear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
 
-        self.o_proj = nn.Linear(
+        self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             config.hidden_size,
             bias=config.attention_bias,
@@ -525,12 +624,30 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        
+        self.pipeline_size = getattr(config, 'pipeline_size', 1)
+        self.pipeline_rank = getattr(config, 'pipeline_rank', 0)
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        if self.pipeline_rank == 0:
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        else:
+            self.embed_tokens = None
+            
+        # Layer slicing
+        num_layers = config.num_hidden_layers
+        layers_per_stage = math.ceil(num_layers / self.pipeline_size)
+        start_layer = self.pipeline_rank * layers_per_stage
+        end_layer = min(start_layer + layers_per_stage, num_layers)
+        
         self.layers = nn.ModuleList(
-            [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [DeepseekV3DecoderLayer(config, layer_idx) for layer_idx in range(start_layer, end_layer)]
         )
-        self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        if self.pipeline_rank == self.pipeline_size - 1:
+            self.norm = DeepseekV3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = None
+            
         self.rotary_emb = DeepseekV3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -551,10 +668,34 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+            # In PP, rank > 0 might have neither if we don't pass them.
+            # But we assume input_ids is passed for shape.
+            if self.pipeline_rank == 0:
+                raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+        if self.pipeline_rank == 0:
+            if inputs_embeds is None:
+                inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+            hidden_states = inputs_embeds
+        else:
+            # Recv hidden_states
+            # Assume input_ids passed for shape
+            batch_size, seq_len = input_ids.shape
+            hidden_states = torch.empty((batch_size, seq_len, self.config.hidden_size), device=input_ids.device, dtype=torch.float16) # Assume fp16/bf16
+            # We need to know dtype. 
+            # For now assume half precision if cuda? Or float32?
+            # Let's use config.torch_dtype if available, else float32.
+            dtype = getattr(self.config, 'torch_dtype', torch.float32)
+            hidden_states = hidden_states.to(dtype)
+            
+            src_rank = dist.get_global_rank(get_pp_group(), get_prev_pp_rank())
+            dist.recv(hidden_states, src=src_rank, group=get_pp_group())
+            
+            # We also need inputs_embeds for causal_mask shape?
+            # inputs_embeds is None here.
+            # create_causal_mask uses inputs_embeds.shape
+            # We can mock it.
+            inputs_embeds = hidden_states # Just for shape
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -577,10 +718,10 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
             position_ids=position_ids,
         )
 
-        hidden_states = inputs_embeds
+        # hidden_states is already set
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
@@ -590,6 +731,11 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+
+        if self.pipeline_rank < self.pipeline_size - 1:
+            dst_rank = dist.get_global_rank(get_pp_group(), get_next_pp_rank())
+            dist.send(hidden_states, dst=dst_rank, group=get_pp_group())
+            return BaseModelOutputWithPast(last_hidden_state=None)
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
@@ -608,7 +754,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.lm_head = ColumnParallelLinear(config.hidden_size, config.vocab_size, bias=False, gather_output=True)
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -657,6 +803,9 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs.last_hidden_state
+        if hidden_states is None:
+            return CausalLMOutputWithPast(loss=None, logits=None)
+
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
