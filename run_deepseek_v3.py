@@ -86,6 +86,8 @@ def main():
         n_routed_experts=4,
         num_experts_per_tok=2,
         n_shared_experts=1,
+        n_group=1,
+        topk_group=1,
         q_lora_rank=None,
         kv_lora_rank=64,
         qk_rope_head_dim=32,
