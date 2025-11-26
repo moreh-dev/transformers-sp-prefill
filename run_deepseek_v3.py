@@ -73,28 +73,25 @@ def main():
     print(f"Rank {rank}: PP Rank {pp_rank}, SP Rank {sp_rank}")
 
     # Config
-    config = DeepseekV3Config()
-    config.pipeline_size = pp_size
-    config.pipeline_rank = pp_rank
-    config.sequence_parallel_size = sp_size
-    
-    # Use small model for testing
-    config.num_hidden_layers = 4
-    config.hidden_size = 128
-    config.intermediate_size = 256
-    config.num_attention_heads = 4
-    config.num_key_value_heads = 4
-    config.vocab_size = 1000
-    config.n_routed_experts = 4
-    config.num_experts_per_tok = 2
-    config.n_shared_experts = 1
-    
-    # Disable some features to simplify
-    config.q_lora_rank = None 
-    config.kv_lora_rank = 64
-    config.qk_rope_head_dim = 32
-    config.qk_nope_head_dim = 32
-    config.v_head_dim = 64
+    config = DeepseekV3Config(
+        pipeline_size=pp_size,
+        pipeline_rank=pp_rank,
+        sequence_parallel_size=sp_size,
+        num_hidden_layers=4,
+        hidden_size=128,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=1000,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        q_lora_rank=None,
+        kv_lora_rank=64,
+        qk_rope_head_dim=32,
+        qk_nope_head_dim=32,
+        v_head_dim=64,
+    )
 
     model = DeepseekV3ForCausalLM(config)
     
