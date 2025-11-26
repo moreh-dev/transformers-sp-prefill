@@ -32,15 +32,15 @@ from ...utils.generic import check_model_inputs
 from .configuration_deepseek_v3 import DeepseekV3Config
 import torch.distributed as dist
 
-_TP_GROUP = None
+_SP_GROUP = None
 _PP_GROUP = None
 
-def set_tp_group(group):
-    global _TP_GROUP
-    _TP_GROUP = group
+def set_sp_group(group):
+    global _SP_GROUP
+    _SP_GROUP = group
 
-def get_tp_group():
-    return _TP_GROUP
+def get_sp_group():
+    return _SP_GROUP
 
 def set_pp_group(group):
     global _PP_GROUP
@@ -68,65 +68,6 @@ def get_prev_pp_rank():
     rank = get_pp_rank()
     world = get_pp_world_size()
     return (rank - 1) % world
-
-class ColumnParallelLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True, gather_output=False):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.gather_output = gather_output
-        self.process_group = get_tp_group()
-        self.tp_size = dist.get_world_size(group=self.process_group) if self.process_group else 1
-        self.tp_rank = dist.get_rank(group=self.process_group) if self.process_group else 0
-        
-        self.output_size_per_partition = out_features // self.tp_size
-        self.weight = nn.Parameter(torch.empty(self.output_size_per_partition, in_features))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(self.output_size_per_partition))
-        else:
-            self.register_parameter('bias', None)
-        
-        # Init weights
-        nn.init.xavier_normal_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-    def forward(self, input):
-        output = F.linear(input, self.weight, self.bias)
-        if self.gather_output and self.tp_size > 1:
-            # All-gather output
-            outputs = [torch.empty_like(output) for _ in range(self.tp_size)]
-            dist.all_gather(outputs, output, group=self.process_group)
-            output = torch.cat(outputs, dim=-1)
-        return output
-
-class RowParallelLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=True):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.process_group = get_tp_group()
-        self.tp_size = dist.get_world_size(group=self.process_group) if self.process_group else 1
-        self.tp_rank = dist.get_rank(group=self.process_group) if self.process_group else 0
-        
-        self.input_size_per_partition = in_features // self.tp_size
-        self.weight = nn.Parameter(torch.empty(out_features, self.input_size_per_partition))
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_features))
-        else:
-            self.register_parameter('bias', None)
-            
-        nn.init.xavier_normal_(self.weight)
-        if self.bias is not None:
-            nn.init.zeros_(self.bias)
-
-    def forward(self, input):
-        output = F.linear(input, self.weight)
-        if self.tp_size > 1:
-            dist.all_reduce(output, group=self.process_group)
-        if self.bias is not None:
-            output = output + self.bias
-        return output
 
 
 
@@ -194,9 +135,9 @@ class DeepseekV3MLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size if intermediate_size is None else intermediate_size
         
-        self.gate_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = ColumnParallelLinear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = RowParallelLinear(self.intermediate_size, self.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
@@ -443,11 +384,11 @@ class DeepseekV3Attention(nn.Module):
 
         self.is_causal = True
         if self.q_lora_rank is None:
-            self.q_proj = ColumnParallelLinear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
+            self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
             self.q_a_layernorm = DeepseekV3RMSNorm(config.q_lora_rank)
-            self.q_b_proj = ColumnParallelLinear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
+            self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
 
         self.kv_a_proj_with_mqa = nn.Linear(
             config.hidden_size,
@@ -455,13 +396,13 @@ class DeepseekV3Attention(nn.Module):
             bias=config.attention_bias,
         )
         self.kv_a_layernorm = DeepseekV3RMSNorm(self.kv_lora_rank)
-        self.kv_b_proj = ColumnParallelLinear(
+        self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
 
-        self.o_proj = RowParallelLinear(
+        self.o_proj = nn.Linear(
             self.num_heads * self.v_head_dim,
             config.hidden_size,
             bias=config.attention_bias,
@@ -512,6 +453,26 @@ class DeepseekV3Attention(nn.Module):
 
         query_states = torch.cat((q_pass, q_rot), dim=-1)
         key_states = torch.cat((k_pass, k_rot), dim=-1)
+        
+        # Sequence Parallel: All-gather Key and Value states
+        sp_group = get_sp_group()
+        if sp_group is not None and dist.get_world_size(group=sp_group) > 1:
+            # key_states: [batch, heads, seq_len, head_dim]
+            # value_states: [batch, heads, seq_len, head_dim]
+            # We need to gather along seq_len dimension (dim 2)
+            
+            # Prepare output tensors
+            sp_size = dist.get_world_size(group=sp_group)
+            
+            # Gather keys
+            gathered_keys = [torch.empty_like(key_states) for _ in range(sp_size)]
+            dist.all_gather(gathered_keys, key_states, group=sp_group)
+            key_states = torch.cat(gathered_keys, dim=2)
+            
+            # Gather values
+            gathered_values = [torch.empty_like(value_states) for _ in range(sp_size)]
+            dist.all_gather(gathered_values, value_states, group=sp_group)
+            value_states = torch.cat(gathered_values, dim=2)
 
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
@@ -754,7 +715,7 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = DeepseekV3Model(config)
         self.vocab_size = config.vocab_size
-        self.lm_head = ColumnParallelLinear(config.hidden_size, config.vocab_size, bias=False, gather_output=True)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         # Initialize weights and apply final processing
         self.post_init()

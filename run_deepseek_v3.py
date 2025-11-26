@@ -13,7 +13,7 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCa
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pipeline_size", type=int, default=1)
-    parser.add_argument("--tensor_parallel_size", type=int, default=1)
+    parser.add_argument("--sequence_parallel_size", type=int, default=1)
     parser.add_argument("--input_seq_len", type=int, default=128)
     args = parser.parse_args()
 
@@ -32,32 +32,32 @@ def main():
     world_size = dist.get_world_size()
 
     pp_size = args.pipeline_size
-    tp_size = args.tensor_parallel_size
+    sp_size = args.sequence_parallel_size
     
-    if world_size != pp_size * tp_size:
+    if world_size != pp_size * sp_size:
         # If running single process for testing, adjust args or warn
         if world_size == 1:
-            print("Running in single process mode (ignoring PP/TP size mismatch for testing logic)")
+            print("Running in single process mode (ignoring PP/SP size mismatch for testing logic)")
             pp_size = 1
-            tp_size = 1
+            sp_size = 1
         else:
-            raise ValueError(f"World size {world_size} != PP {pp_size} * TP {tp_size}")
+            raise ValueError(f"World size {world_size} != PP {pp_size} * SP {sp_size}")
 
     # Create groups
-    # TP groups: Consecutive ranks
+    # SP groups: Consecutive ranks (similar to TP)
     for i in range(pp_size):
-        ranks = list(range(i * tp_size, (i + 1) * tp_size))
+        ranks = list(range(i * sp_size, (i + 1) * sp_size))
         if len(ranks) > 1:
             group = dist.new_group(ranks)
             if rank in ranks:
-                set_tp_group(group)
+                set_sp_group(group)
         else:
             if rank in ranks:
-                set_tp_group(None) # None implies world or self? My code uses None -> 1.
+                set_sp_group(None)
 
     # PP groups: Strided ranks
-    for i in range(tp_size):
-        ranks = list(range(i, world_size, tp_size))
+    for i in range(sp_size):
+        ranks = list(range(i, world_size, sp_size))
         if len(ranks) > 1:
             group = dist.new_group(ranks)
             if rank in ranks:
@@ -67,16 +67,16 @@ def main():
                 set_pp_group(None)
 
     # Calculate ranks
-    pp_rank = rank // tp_size
-    tp_rank = rank % tp_size
+    pp_rank = rank // sp_size
+    sp_rank = rank % sp_size
     
-    print(f"Rank {rank}: PP Rank {pp_rank}, TP Rank {tp_rank}")
+    print(f"Rank {rank}: PP Rank {pp_rank}, SP Rank {sp_rank}")
 
     # Config
     config = DeepseekV3Config()
     config.pipeline_size = pp_size
     config.pipeline_rank = pp_rank
-    config.tensor_parallel_size = tp_size
+    config.sequence_parallel_size = sp_size
     
     # Use small model for testing
     config.num_hidden_layers = 4
@@ -99,7 +99,18 @@ def main():
     model = DeepseekV3ForCausalLM(config)
     
     # Input
+    # Generate full input on all ranks (or just rank 0 and broadcast, but random with same seed is easier if seed set)
+    torch.manual_seed(42)
     input_ids = torch.randint(0, config.vocab_size, (1, args.input_seq_len))
+    
+    # Split input_ids for SP
+    if sp_size > 1:
+        seq_len = args.input_seq_len
+        sp_seq_len = seq_len // sp_size
+        start_idx = sp_rank * sp_seq_len
+        end_idx = start_idx + sp_seq_len
+        input_ids = input_ids[:, start_idx:end_idx]
+        print(f"Rank {rank}: Processing sequence chunk {start_idx}:{end_idx}")
     
     device = torch.device("cpu")
     if torch.cuda.is_available():
